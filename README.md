@@ -1,1 +1,3 @@
-# Interactive-Sales-Report-Excel-Dashboard-
+# Interactive-Sales-Report-Excel-Dashboard
+
+This repository provides a comprehensive guide and codebase to create an interactive Excel dashboard aimed at analyzing sales data for Atliq, a retail store, to generate a detailed report for the year 2022. The process involves three main steps: data cleaning, data preprocessing, and report generation. The objective of this project is to assist Atliq in understanding its customer base better and strategizing for increased sales in 2023. Sample insights from the generated report are provided, leading to a final conclusion suggesting targeted marketing strategies. Specifically, the recommendation is to focus on women customers aged 30-49 residing in Maharashtra, Karnataka, and Uttar Pradesh, by leveraging advertisements, offers, and coupons available on popular platforms such as Amazon, Flipkart, and Myntra.
