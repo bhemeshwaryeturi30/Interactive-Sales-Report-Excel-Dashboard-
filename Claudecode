@@ -1,0 +1,390 @@
+# tableau_inventory_enhanced.py
+import os
+import sys
+import subprocess
+import pandas as pd
+import tableauserverclient as TSC
+from datetime import datetime
+import logging
+import time
+from typing import Dict, List, Optional, Tuple
+
+# ===== CONFIGURATION =====
+SERVER      = "https://mytableau.cvs.com"   # Root URL (no '/#/')
+SITE_ID     = "RX_OPS"                      # e.g., RX_OPS
+PAT_NAME    = "YOUR_PAT_NAME"
+PAT_SECRET  = "YOUR_PAT_SECRET"
+
+OUTPUT_CSV        = "tableau_inventory.csv"
+DOWNLOAD_VIEW_CSV = False                   # True = export underlying data CSVs for each view (needs permission)
+VIEW_CSV_DIR      = "view_csvs"
+PAGE_SIZE         = 1000                    # Max page size for TSC
+INCLUDE_USERS     = False                   # Set to True if you want user details (slower)
+MAX_RETRIES       = 3                       # Max retries for failed API calls
+RETRY_DELAY       = 2                       # Seconds to wait between retries
+# =========================
+
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('tableau_inventory.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+def link_for_view(server_base: str, site_id: str, content_url: str) -> str:
+    """Generate view URL"""
+    return f"{server_base}/#/site/{site_id}/views/{content_url}"
+
+def link_for_workbook(server_base: str, site_id: str, content_url: str) -> str:
+    """Generate workbook URL"""
+    return f"{server_base}/#/site/{site_id}/workbooks/{content_url}"
+
+def has_more(pagination) -> bool:
+    """Check if there are more pages to fetch"""
+    return pagination.page_number * pagination.page_size < pagination.total_available
+
+def retry_api_call(func, *args, max_retries: int = MAX_RETRIES, **kwargs):
+    """Retry wrapper for API calls"""
+    for attempt in range(max_retries):
+        try:
+            return func(*args, **kwargs)
+        except Exception as e:
+            if attempt == max_retries - 1:
+                logger.error(f"Failed after {max_retries} attempts: {e}")
+                raise
+            logger.warning(f"Attempt {attempt + 1} failed: {e}. Retrying in {RETRY_DELAY} seconds...")
+            time.sleep(RETRY_DELAY)
+
+def open_excel(filepath: str):
+    """Force open a file in Excel (Windows). Falls back to default opener on other OS."""
+    try:
+        if sys.platform.startswith("win"):
+            subprocess.Popen(["excel.exe", filepath], shell=True)
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", "-a", "Microsoft Excel", filepath])
+        else:
+            subprocess.Popen(["xdg-open", filepath])
+    except Exception as e:
+        logger.warning(f"Could not open in Excel: {e}")
+        # Fallback to default handler
+        try:
+            if sys.platform.startswith("win"):
+                subprocess.Popen(["start", "", filepath], shell=True)
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", filepath])
+            else:
+                subprocess.Popen(["xdg-open", filepath])
+        except Exception as e2:
+            logger.warning(f"Fallback open failed: {e2}")
+
+def open_folder(path: str):
+    """Open folder in file explorer"""
+    try:
+        if sys.platform.startswith("win"):
+            subprocess.Popen(["explorer", path])
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", path])
+        else:
+            subprocess.Popen(["xdg-open", path])
+    except Exception as e:
+        logger.warning(f"Could not open folder: {e}")
+
+def safe_filename(name: str) -> str:
+    """Create a safe filename by removing/replacing invalid characters"""
+    invalid_chars = '<>:"/\\|?*'
+    for char in invalid_chars:
+        name = name.replace(char, '_')
+    return name[:200]  # Limit length to avoid path issues
+
+def get_projects(server: TSC.Server) -> Dict[str, TSC.ProjectItem]:
+    """Fetch all projects with retry logic"""
+    logger.info("Fetching projects...")
+    projects_by_id = {}
+    preq = TSC.RequestOptions()
+    preq.page_size = PAGE_SIZE
+    
+    while True:
+        projects, p_page = retry_api_call(server.projects.get, req_options=preq)
+        for p in projects:
+            projects_by_id[p.id] = p
+        
+        logger.info(f"Fetched {len(projects)} projects (page {p_page.page_number})")
+        
+        if has_more(p_page):
+            preq.page_number = p_page.page_number + 1
+        else:
+            break
+    
+    logger.info(f"Total projects fetched: {len(projects_by_id)}")
+    return projects_by_id
+
+def get_users(server: TSC.Server) -> Dict[str, TSC.UserItem]:
+    """Fetch all users with retry logic (optional)"""
+    if not INCLUDE_USERS:
+        return {}
+    
+    logger.info("Fetching users...")
+    users_by_id = {}
+    try:
+        ureq = TSC.RequestOptions()
+        ureq.page_size = PAGE_SIZE
+        
+        while True:
+            users, u_page = retry_api_call(server.users.get, req_options=ureq)
+            for u in users:
+                users_by_id[u.id] = u
+            
+            logger.info(f"Fetched {len(users)} users (page {u_page.page_number})")
+            
+            if has_more(u_page):
+                ureq.page_number = u_page.page_number + 1
+            else:
+                break
+    except Exception as e:
+        logger.warning(f"Could not fetch users: {e}")
+        users_by_id = {}
+    
+    logger.info(f"Total users fetched: {len(users_by_id)}")
+    return users_by_id
+
+def get_datasources(server: TSC.Server) -> Dict[str, TSC.DatasourceItem]:
+    """Fetch all datasources with retry logic"""
+    logger.info("Fetching datasources...")
+    ds_by_id = {}
+    try:
+        dreq = TSC.RequestOptions()
+        dreq.page_size = PAGE_SIZE
+        
+        while True:
+            datasources, d_page = retry_api_call(server.datasources.get, req_options=dreq)
+            for d in datasources:
+                ds_by_id[d.id] = d
+            
+            logger.info(f"Fetched {len(datasources)} datasources (page {d_page.page_number})")
+            
+            if has_more(d_page):
+                dreq.page_number = d_page.page_number + 1
+            else:
+                break
+    except Exception as e:
+        logger.warning(f"Could not fetch datasources: {e}")
+        ds_by_id = {}
+    
+    logger.info(f"Total datasources fetched: {len(ds_by_id)}")
+    return ds_by_id
+
+def get_view_usage_stats(server: TSC.Server) -> Dict[str, int]:
+    """Preload usage stats for views"""
+    logger.info("Fetching view usage statistics...")
+    view_usage_by_id = {}
+    try:
+        vreq = TSC.RequestOptions()
+        vreq.page_size = PAGE_SIZE
+        vreq.include_usage_statistics = True
+        
+        while True:
+            views_page, v_page = retry_api_call(server.views.get, req_options=vreq)
+            for vv in views_page:
+                view_usage_by_id[vv.id] = getattr(vv, "total_views", None)
+            
+            logger.info(f"Fetched usage stats for {len(views_page)} views (page {v_page.page_number})")
+            
+            if has_more(v_page):
+                vreq.page_number = v_page.page_number + 1
+            else:
+                break
+    except Exception as e:
+        logger.warning(f"Could not fetch view usage statistics: {e}")
+        view_usage_by_id = {}
+    
+    logger.info(f"Total view usage stats fetched: {len(view_usage_by_id)}")
+    return view_usage_by_id
+
+def download_view_csv(server: TSC.Server, view: TSC.ViewItem, project_name: str, workbook_name: str) -> Optional[str]:
+    """Download CSV for a specific view"""
+    if not DOWNLOAD_VIEW_CSV:
+        return None
+    
+    try:
+        os.makedirs(VIEW_CSV_DIR, exist_ok=True)
+        csv_bytes = retry_api_call(server.views.populate_csv, view)
+        
+        safe_proj = safe_filename(project_name or 'NoProject')
+        safe_wb = safe_filename(workbook_name)
+        safe_view = safe_filename(view.name)
+        
+        filename = f"{safe_proj}__{safe_wb}__{safe_view}.csv"
+        saved_csv_path = os.path.join(VIEW_CSV_DIR, filename)
+        
+        with open(saved_csv_path, "wb") as f:
+            f.write(csv_bytes)
+        
+        return saved_csv_path
+    except Exception as e:
+        logger.error(f"Failed to download CSV for view {view.name}: {e}")
+        return f"ERROR: {e}"
+
+def process_workbooks(server: TSC.Server, projects_by_id: Dict, users_by_id: Dict, 
+                     ds_by_id: Dict, view_usage_by_id: Dict) -> List[Dict]:
+    """Process all workbooks and their views"""
+    logger.info("Processing workbooks...")
+    rows = []
+    
+    wb_req = TSC.RequestOptions()
+    wb_req.page_size = PAGE_SIZE
+    
+    total_workbooks = 0
+    
+    while True:
+        workbooks, w_page = retry_api_call(server.workbooks.get, req_options=wb_req)
+        
+        for wb in workbooks:
+            total_workbooks += 1
+            logger.info(f"Processing workbook {total_workbooks}: {wb.name}")
+            
+            # Populate views & connections for this workbook
+            try:
+                retry_api_call(server.workbooks.populate_views, wb)
+            except Exception as e:
+                logger.warning(f"Could not populate views for workbook {wb.name}: {e}")
+                wb.views = []
+
+            try:
+                retry_api_call(server.workbooks.populate_connections, wb)
+            except Exception as e:
+                logger.warning(f"Could not populate connections for workbook {wb.name}: {e}")
+                wb.connections = []
+
+            proj = projects_by_id.get(wb.project_id)
+            owner = users_by_id.get(wb.owner_id) if INCLUDE_USERS else None
+            wb_url = link_for_workbook(SERVER, SITE_ID, wb.content_url)
+
+            # Process datasource information
+            ds_names, ds_types, ds_ids = [], [], []
+            for c in getattr(wb, "connections", []):
+                ds_obj = ds_by_id.get(getattr(c, "datasource_id", None))
+                if ds_obj:
+                    ds_names.append(ds_obj.name or "")
+                    ds_types.append(ds_obj.connection_type or "")
+                    ds_ids.append(ds_obj.id)
+                else:
+                    ds_names.append(getattr(c, "server_address", "") or "embedded/unknown")
+                    ds_types.append(getattr(c, "connection_type", "") or "unknown")
+                    ds_ids.append("")
+
+            # Process views
+            for v in getattr(wb, "views", []):
+                v_url = link_for_view(SERVER, SITE_ID, v.content_url)
+                total_views = view_usage_by_id.get(v.id, None)
+                
+                # Download view CSV if enabled
+                saved_csv_path = download_view_csv(server, v, proj.name if proj else None, wb.name)
+
+                rows.append({
+                    "project_name":        proj.name if proj else None,
+                    "project_id":          wb.project_id,
+                    "project_description": getattr(proj, "description", None) if proj else None,
+                    "workbook_name":       wb.name,
+                    "workbook_id":         wb.id,
+                    "workbook_url":        wb_url,
+                    "workbook_description": getattr(wb, "description", None),
+                    "workbook_created":    getattr(wb, "created_at", None),
+                    "workbook_updated":    getattr(wb, "updated_at", None),
+                    "workbook_size":       getattr(wb, "size", None),
+                    "owner_id":            getattr(wb, "owner_id", None),
+                    "owner_name":          owner.name if owner else None,
+                    "owner_email":         getattr(owner, "email", None) if owner else None,
+                    "view_name":           v.name,
+                    "view_id":             v.id,
+                    "view_url":            v_url,
+                    "view_total_views":    total_views,
+                    "view_created":        getattr(v, "created_at", None),
+                    "view_updated":        getattr(v, "updated_at", None),
+                    "datasource_names":    "; ".join(sorted(set(n for n in ds_names if n))),
+                    "datasource_types":    "; ".join(sorted(set(t for t in ds_types if t))),
+                    "datasource_ids":      "; ".join(sorted(set(i for i in ds_ids if i))),
+                    "total_connections":   len(getattr(wb, "connections", [])),
+                    "saved_view_csv":      saved_csv_path
+                })
+
+        logger.info(f"Processed page {w_page.page_number} with {len(workbooks)} workbooks")
+        
+        if has_more(w_page):
+            wb_req.page_number = w_page.page_number + 1
+        else:
+            break
+
+    logger.info(f"Total workbooks processed: {total_workbooks}")
+    logger.info(f"Total rows created: {len(rows)}")
+    return rows
+
+def main():
+    """Main execution function"""
+    start_time = datetime.now()
+    logger.info(f"Starting Tableau inventory extraction at {start_time}")
+    
+    try:
+        # Initialize server connection
+        server = TSC.Server(SERVER, use_server_version=True)
+        auth = TSC.PersonalAccessTokenAuth(PAT_NAME, PAT_SECRET, SITE_ID)
+
+        with server.auth.sign_in(auth):
+            logger.info(f"Successfully signed in to {SERVER}")
+            
+            # Fetch all required data
+            projects_by_id = get_projects(server)
+            users_by_id = get_users(server)
+            ds_by_id = get_datasources(server)
+            view_usage_by_id = get_view_usage_stats(server)
+            
+            # Process workbooks and views
+            rows = process_workbooks(server, projects_by_id, users_by_id, ds_by_id, view_usage_by_id)
+
+        # Save results
+        output_path = os.path.abspath(OUTPUT_CSV)
+        df = pd.DataFrame(rows)
+        
+        # Sort by project, workbook, then view name
+        df_sorted = df.sort_values(
+            ["project_name", "workbook_name", "view_name"], 
+            na_position="last"
+        )
+        
+        # Save to CSV
+        df_sorted.to_csv(output_path, index=False)
+        
+        # Generate summary statistics
+        total_projects = df['project_id'].nunique()
+        total_workbooks = df['workbook_id'].nunique()
+        total_views = len(df)
+        
+        end_time = datetime.now()
+        duration = end_time - start_time
+        
+        logger.info(f"✅ Extraction completed successfully!")
+        logger.info(f"📊 Summary:")
+        logger.info(f"   - Projects: {total_projects}")
+        logger.info(f"   - Workbooks: {total_workbooks}")
+        logger.info(f"   - Views: {total_views}")
+        logger.info(f"   - Duration: {duration}")
+        logger.info(f"📄 Output saved to: {output_path}")
+        
+        if DOWNLOAD_VIEW_CSV:
+            csv_dir = os.path.abspath(VIEW_CSV_DIR)
+            logger.info(f"📁 Per-view CSVs saved to: {csv_dir}")
+
+        # Open results
+        open_excel(output_path)
+        if DOWNLOAD_VIEW_CSV:
+            open_folder(os.path.abspath(VIEW_CSV_DIR))
+            
+    except Exception as e:
+        logger.error(f"❌ Script failed: {e}")
+        raise
+
+if __name__ == "__main__":
+    main()
