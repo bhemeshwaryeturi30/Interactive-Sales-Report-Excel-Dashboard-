@@ -1,0 +1,180 @@
+# tableau_inventory_pat_no_users_OPEN_EXCEL.py
+import os
+import sys
+import subprocess
+import pandas as pd
+import tableauserverclient as TSC
+
+# ===== EDIT THESE =====
+SERVER      = "https://mytableau.cvs.com"   # Root URL (no '/#/')
+SITE_ID     = "RX_OPS"                      # e.g., RX_OPS
+PAT_NAME    = "YOUR_PAT_NAME"
+PAT_SECRET  = "YOUR_PAT_SECRET"
+
+OUTPUT_CSV        = "tableau_inventory.csv"
+DOWNLOAD_VIEW_CSV = False                   # True = export underlying data CSVs for each view (needs permission)
+VIEW_CSV_DIR      = "view_csvs"
+PAGE_SIZE         = 1000                    # Max page size for TSC
+# ======================
+
+def link_for_view(server_base, site_id, content_url):
+    return f"{server_base}/#/site/{site_id}/views/{content_url}"
+
+def link_for_workbook(server_base, site_id, content_url):
+    return f"{server_base}/#/site/{site_id}/workbooks/{content_url}"
+
+def has_more(pagination):
+    # Newer TSC has: page_number (1-based), page_size, total_available
+    return pagination.page_number * pagination.page_size < pagination.total_available
+
+def open_path(path):
+    """Open a file/folder with the OS default handler."""
+    try:
+        if sys.platform.startswith("win"):
+            # Works reliably from VS Code’s terminal too
+            subprocess.run(["start", "", path], shell=True)
+        elif sys.platform == "darwin":
+            subprocess.run(["open", path])
+        else:
+            subprocess.run(["xdg-open", path])
+    except Exception as e:
+        print(f"⚠️ Could not auto-open: {e}")
+
+def main():
+    server = TSC.Server(SERVER, use_server_version=True)
+    auth   = TSC.PersonalAccessTokenAuth(PAT_NAME, PAT_SECRET, SITE_ID)
+
+    rows = []
+
+    with server.auth.sign_in(auth):
+        # ---- Projects (paged) ----
+        projects_by_id = {}
+        preq = TSC.RequestOptions(); preq.page_size = PAGE_SIZE
+        while True:
+            projects, p_page = server.projects.get(req_options=preq)
+            for p in projects:
+                projects_by_id[p.id] = p
+            if has_more(p_page):
+                preq.page_number = p_page.page_number + 1
+            else:
+                break
+
+        # ---- Datasources (optional, best-effort) ----
+        ds_by_id = {}
+        try:
+            dreq = TSC.RequestOptions(); dreq.page_size = PAGE_SIZE
+            while True:
+                datasources, d_page = server.datasources.get(req_options=dreq)
+                for d in datasources:
+                    ds_by_id[d.id] = d
+                if has_more(d_page):
+                    dreq.page_number = d_page.page_number + 1
+                else:
+                    break
+        except Exception:
+            ds_by_id = {}
+
+        # ---- Preload usage stats for views (safe) ----
+        view_usage_by_id = {}
+        try:
+            vreq = TSC.RequestOptions()
+            vreq.page_size = PAGE_SIZE
+            vreq.include_usage_statistics = True
+            while True:
+                views_page, v_page = server.views.get(req_options=vreq)
+                for vv in views_page:
+                    view_usage_by_id[vv.id] = getattr(vv, "total_views", None)
+                if has_more(v_page):
+                    vreq.page_number = v_page.page_number + 1
+                else:
+                    break
+        except Exception:
+            view_usage_by_id = {}
+
+        # ---- Workbooks (paged) ----
+        wb_req = TSC.RequestOptions(); wb_req.page_size = PAGE_SIZE
+        while True:
+            workbooks, w_page = server.workbooks.get(req_options=wb_req)
+
+            for wb in workbooks:
+                # Populate views & connections for this workbook
+                try:
+                    server.workbooks.populate_views(wb)
+                except Exception:
+                    wb.views = []
+
+                try:
+                    server.workbooks.populate_connections(wb)
+                except Exception:
+                    wb.connections = []
+
+                proj   = projects_by_id.get(wb.project_id)
+                wb_url = link_for_workbook(SERVER, SITE_ID, wb.content_url)
+
+                # Datasource hints
+                ds_names, ds_types = [], []
+                for c in getattr(wb, "connections", []):
+                    ds_obj = ds_by_id.get(getattr(c, "datasource_id", None))
+                    if ds_obj:
+                        ds_names.append(ds_obj.name or "")
+                        ds_types.append(ds_obj.connection_type or "")
+                    else:
+                        ds_names.append(getattr(c, "server_address", "") or "embedded/unknown")
+                        ds_types.append(getattr(c, "connection_type", "") or "unknown")
+
+                for v in getattr(wb, "views", []):
+                    v_url = link_for_view(SERVER, SITE_ID, v.content_url)
+                    total_views = view_usage_by_id.get(v.id, None)  # don’t touch v.total_views directly
+
+                    saved_csv_path = None
+                    if DOWNLOAD_VIEW_CSV:
+                        try:
+                            os.makedirs(VIEW_CSV_DIR, exist_ok=True)
+                            csv_bytes = server.views.populate_csv(v)  # requires "Download Full Data"
+                            safe = f"{(proj.name if proj else 'NoProject')}__{wb.name}__{v.name}".replace("/", "_").replace("\\", "_")
+                            saved_csv_path = os.path.join(VIEW_CSV_DIR, f"{safe}.csv")
+                            with open(saved_csv_path, "wb") as f:
+                                f.write(csv_bytes)
+                        except Exception as e:
+                            saved_csv_path = f"ERROR: {e}"
+
+                    rows.append({
+                        "project_name":      proj.name if proj else None,
+                        "project_id":        wb.project_id,
+                        "workbook_name":     wb.name,
+                        "workbook_id":       wb.id,
+                        "workbook_url":      wb_url,
+                        "workbook_created":  getattr(wb, "created_at", None),
+                        "workbook_updated":  getattr(wb, "updated_at", None),
+                        "owner_id":          getattr(wb, "owner_id", None),  # UUID; we avoid /users
+                        "view_name":         v.name,
+                        "view_id":           v.id,
+                        "view_url":          v_url,
+                        "view_total_views":  total_views,
+                        "datasource_names":  "; ".join(sorted(set(n for n in ds_names if n))),
+                        "datasource_types":  "; ".join(sorted(set(t for t in ds_types if t))),
+                        "saved_view_csv":    saved_csv_path
+                    })
+
+            if has_more(w_page):
+                wb_req.page_number = w_page.page_number + 1
+            else:
+                break
+
+    # ---- Save & report path ----
+    output_path = os.path.abspath(OUTPUT_CSV)
+    pd.DataFrame(rows).sort_values(
+        ["project_name", "workbook_name", "view_name"], na_position="last"
+    ).to_csv(output_path, index=False)
+
+    print(f"✅ Wrote {len(rows):,} rows to:\n{output_path}")
+    if DOWNLOAD_VIEW_CSV:
+        print(f"📁 Per-view CSVs (if exported) saved under:\n{os.path.abspath(VIEW_CSV_DIR)}")
+
+    # ---- Auto-open CSV (and folder if exporting per-view CSVs) ----
+    open_path(output_path)
+    if DOWNLOAD_VIEW_CSV:
+        open_path(os.path.abspath(VIEW_CSV_DIR))
+
+if __name__ == "__main__":
+    main()
