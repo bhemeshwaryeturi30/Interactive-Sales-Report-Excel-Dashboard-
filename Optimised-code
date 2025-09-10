@@ -1,0 +1,423 @@
+# tableau_inventory_optimized.py
+import os
+import sys
+import subprocess
+import pandas as pd
+import tableauserverclient as TSC
+from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
+from collections import defaultdict
+
+# ===== EDIT THESE =====
+SERVER      = "https://mytableau.cvs.com"   # Root URL (no '/#/')
+SITE_ID     = "RX_OPS"                      # e.g., RX_OPS
+PAT_NAME    = "xxxxx"
+PAT_SECRET  = "xxxxxxxxxx"
+
+OUTPUT_CSV        = "tableau_inventory_optimized.csv"
+DOWNLOAD_VIEW_CSV = False                   # True = export underlying data CSVs for each view (needs permission)
+VIEW_CSV_DIR      = "view_csvs"
+PAGE_SIZE         = 1000                    # Max page size for TSC
+MAX_THREADS       = 5                       # Concurrent threads for processing workbooks
+# ======================
+
+# Thread-safe progress tracking
+progress_lock = threading.Lock()
+progress_data = {'processed': 0, 'total': 0}
+
+def print_progress_bar(current, total, prefix='Progress', suffix='Complete', length=50, fill='█'):
+    """Print a progress bar to terminal"""
+    if total == 0:
+        return
+    percent = f"{100 * (current / float(total)):.1f}"
+    filled_length = int(length * current // total)
+    bar = fill * filled_length + '-' * (length - filled_length)
+    print(f'\r{prefix} |{bar}| {percent}% {suffix} ({current}/{total})', end='', flush=True)
+    if current == total:
+        print()  # New line when complete
+
+def update_progress():
+    """Thread-safe progress update"""
+    with progress_lock:
+        progress_data['processed'] += 1
+        print_progress_bar(progress_data['processed'], progress_data['total'], 
+                         prefix='📚 Workbooks', suffix='processed')
+
+def link_for_view(server_base, site_id, content_url):
+    return f"{server_base}/#/site/{site_id}/views/{content_url}"
+
+def link_for_workbook(server_base, site_id, content_url):
+    return f"{server_base}/#/site/{site_id}/workbooks/{content_url}"
+
+def has_more(pagination):
+    return pagination.page_number * pagination.page_size < pagination.total_available
+
+def open_excel(filepath):
+    """Force open a file in Excel (Windows). Falls back to default opener on other OS."""
+    try:
+        if sys.platform.startswith("win"):
+            subprocess.Popen(["excel.exe", filepath], shell=True)
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", "-a", "Microsoft Excel", filepath])
+        else:
+            subprocess.Popen(["xdg-open", filepath])
+    except Exception as e:
+        print(f"⚠️ Could not open in Excel: {e}")
+
+def open_folder(path):
+    try:
+        if sys.platform.startswith("win"):
+            subprocess.Popen(["explorer", path])
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", path])
+        else:
+            subprocess.Popen(["xdg-open", path])
+    except Exception as e:
+        print(f"⚠️ Could not open folder: {e}")
+
+def fetch_all_users(server):
+    """Fetch all users and return a dictionary mapping user_id to user info"""
+    print("👥 Fetching all users...")
+    users_by_id = {}
+    try:
+        ureq = TSC.RequestOptions()
+        ureq.page_size = PAGE_SIZE
+        user_count = 0
+        
+        while True:
+            users, u_page = server.users.get(req_options=ureq)
+            for user in users:
+                users_by_id[user.id] = {
+                    'name': user.name,
+                    'fullname': user.fullname,
+                    'email': getattr(user, 'email', None)
+                }
+                user_count += 1
+            
+            if u_page.total_available > 0:
+                print_progress_bar(user_count, u_page.total_available, 
+                                 prefix='Users', suffix='fetched')
+            
+            if has_more(u_page):
+                ureq.page_number = u_page.page_number + 1
+            else:
+                break
+                
+        print(f"✅ Fetched {len(users_by_id):,} users")
+        return users_by_id
+    except Exception as e:
+        print(f"⚠️ Error fetching users: {e}")
+        return {}
+
+def fetch_all_data_efficiently(server):
+    """Fetch all basic data in bulk with minimal API calls"""
+    print("🔄 Fetching all data efficiently...")
+    
+    # Fetch projects
+    print("📁 Fetching projects...")
+    projects_by_id = {}
+    preq = TSC.RequestOptions()
+    preq.page_size = PAGE_SIZE
+    project_count = 0
+    while True:
+        projects, p_page = server.projects.get(req_options=preq)
+        for p in projects:
+            projects_by_id[p.id] = p
+            project_count += 1
+        
+        if p_page.total_available > 0:
+            print_progress_bar(project_count, p_page.total_available, 
+                             prefix='Projects', suffix='fetched')
+        
+        if has_more(p_page):
+            preq.page_number = p_page.page_number + 1
+        else:
+            break
+    print(f"✅ Fetched {len(projects_by_id):,} projects")
+    
+    # Fetch users
+    users_by_id = fetch_all_users(server)
+    
+    # Fetch datasources
+    print("💾 Fetching datasources...")
+    ds_by_id = {}
+    try:
+        dreq = TSC.RequestOptions()
+        dreq.page_size = PAGE_SIZE
+        ds_count = 0
+        while True:
+            datasources, d_page = server.datasources.get(req_options=dreq)
+            for d in datasources:
+                ds_by_id[d.id] = d
+                ds_count += 1
+            
+            if d_page.total_available > 0:
+                print_progress_bar(ds_count, d_page.total_available, 
+                                 prefix='Datasources', suffix='fetched')
+            
+            if has_more(d_page):
+                dreq.page_number = d_page.page_number + 1
+            else:
+                break
+    except Exception as e:
+        print(f"⚠️ Error fetching datasources: {e}")
+        ds_by_id = {}
+    print(f"✅ Fetched {len(ds_by_id):,} datasources")
+    
+    # Fetch workbooks with basic info
+    print("📚 Fetching workbooks...")
+    workbooks = []
+    wb_req = TSC.RequestOptions()
+    wb_req.page_size = PAGE_SIZE
+    wb_count = 0
+    total_workbooks = 0
+    
+    while True:
+        wb_page, w_pagination = server.workbooks.get(req_options=wb_req)
+        if total_workbooks == 0:
+            total_workbooks = w_pagination.total_available
+            
+        workbooks.extend(wb_page)
+        wb_count += len(wb_page)
+        
+        print_progress_bar(wb_count, total_workbooks, 
+                         prefix='Workbooks', suffix='fetched')
+        
+        if has_more(w_pagination):
+            wb_req.page_number = w_pagination.page_number + 1
+        else:
+            break
+    
+    print(f"✅ Fetched {len(workbooks):,} workbooks")
+    
+    return projects_by_id, users_by_id, ds_by_id, workbooks
+
+def process_workbook_batch(server, workbooks_batch, projects_by_id, users_by_id, ds_by_id):
+    """Process a batch of workbooks and return rows"""
+    rows = []
+    
+    for wb in workbooks_batch:
+        try:
+            # Populate views and connections for this workbook
+            try:
+                server.workbooks.populate_views(wb)
+            except Exception:
+                wb.views = []
+
+            try:
+                server.workbooks.populate_connections(wb)
+            except Exception:
+                wb.connections = []
+
+            proj = projects_by_id.get(wb.project_id)
+            owner_info = users_by_id.get(wb.owner_id, {})
+            owner_name = owner_info.get('fullname') or owner_info.get('name') or f"Unknown ({wb.owner_id})"
+            
+            wb_url = link_for_workbook(SERVER, SITE_ID, wb.content_url)
+
+            # Datasource hints
+            ds_names, ds_types = [], []
+            for c in getattr(wb, "connections", []):
+                ds_obj = ds_by_id.get(getattr(c, "datasource_id", None))
+                if ds_obj:
+                    ds_names.append(ds_obj.name or "")
+                    ds_types.append(ds_obj.connection_type or "")
+                else:
+                    ds_names.append(getattr(c, "server_address", "") or "embedded/unknown")
+                    ds_types.append(getattr(c, "connection_type", "") or "unknown")
+
+            # Process views
+            for v in getattr(wb, "views", []):
+                v_url = link_for_view(SERVER, SITE_ID, v.content_url)
+                
+                # Get view usage stats safely
+                total_views = None
+                try:
+                    total_views = getattr(v, "total_views", None)
+                except:
+                    pass
+
+                saved_csv_path = None
+                if DOWNLOAD_VIEW_CSV:
+                    try:
+                        os.makedirs(VIEW_CSV_DIR, exist_ok=True)
+                        csv_bytes = server.views.populate_csv(v)
+                        safe = f"{(proj.name if proj else 'NoProject')}__{wb.name}__{v.name}".replace("/", "_").replace("\\", "_")
+                        saved_csv_path = os.path.join(VIEW_CSV_DIR, f"{safe}.csv")
+                        with open(saved_csv_path, "wb") as f:
+                            f.write(csv_bytes)
+                    except Exception as e:
+                        saved_csv_path = f"ERROR: {e}"
+
+                rows.append({
+                    "project_name":      proj.name if proj else None,
+                    "project_id":        wb.project_id,
+                    "workbook_name":     wb.name,
+                    "workbook_id":       wb.id,
+                    "workbook_url":      wb_url,
+                    "workbook_created":  getattr(wb, "created_at", None),
+                    "workbook_updated":  getattr(wb, "updated_at", None),
+                    "owner_id":          wb.owner_id,
+                    "owner_name":        owner_name,
+                    "owner_email":       owner_info.get('email', None),
+                    "view_name":         v.name,
+                    "view_id":           v.id,
+                    "view_url":          v_url,
+                    "view_total_views":  total_views,
+                    "datasource_names":  "; ".join(sorted(set(n for n in ds_names if n))),
+                    "datasource_types":  "; ".join(sorted(set(t for t in ds_types if t))),
+                    "saved_view_csv":    saved_csv_path
+                })
+                
+            # If workbook has no views, still include workbook info
+            if not getattr(wb, "views", []):
+                rows.append({
+                    "project_name":      proj.name if proj else None,
+                    "project_id":        wb.project_id,
+                    "workbook_name":     wb.name,
+                    "workbook_id":       wb.id,
+                    "workbook_url":      wb_url,
+                    "workbook_created":  getattr(wb, "created_at", None),
+                    "workbook_updated":  getattr(wb, "updated_at", None),
+                    "owner_id":          wb.owner_id,
+                    "owner_name":        owner_name,
+                    "owner_email":       owner_info.get('email', None),
+                    "view_name":         None,
+                    "view_id":           None,
+                    "view_url":          None,
+                    "view_total_views":  None,
+                    "datasource_names":  "; ".join(sorted(set(n for n in ds_names if n))),
+                    "datasource_types":  "; ".join(sorted(set(t for t in ds_types if t))),
+                    "saved_view_csv":    None
+                })
+
+        except Exception as e:
+            print(f"\n⚠️ Error processing workbook {wb.name}: {e}")
+        
+        update_progress()
+    
+    return rows
+
+def main():
+    print("="*60)
+    print("🚀 OPTIMIZED TABLEAU INVENTORY EXTRACTION")
+    print("="*60)
+    start_time = datetime.now()
+    print(f"⏰ Started at: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+    
+    server = TSC.Server(SERVER, use_server_version=True)
+    auth = TSC.PersonalAccessTokenAuth(PAT_NAME, PAT_SECRET, SITE_ID)
+
+    all_rows = []
+
+    try:
+        with server.auth.sign_in(auth):
+            print(f"✅ Successfully connected to {SERVER}")
+            print()
+
+            # Fetch all data efficiently
+            projects_by_id, users_by_id, ds_by_id, workbooks = fetch_all_data_efficiently(server)
+            
+            print(f"\n📊 Ready to process {len(workbooks):,} workbooks")
+            
+            # Set up progress tracking
+            progress_data['total'] = len(workbooks)
+            progress_data['processed'] = 0
+            
+            # Process workbooks in batches using threading
+            print("\n" + "="*60)
+            print("🔄 PROCESSING WORKBOOKS WITH THREADING")
+            print("="*60)
+            
+            # Split workbooks into batches for threading
+            batch_size = max(1, len(workbooks) // MAX_THREADS)
+            workbook_batches = [workbooks[i:i + batch_size] for i in range(0, len(workbooks), batch_size)]
+            
+            # Create separate server connections for each thread
+            with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
+                futures = []
+                
+                for batch in workbook_batches:
+                    # Create new server connection for this thread
+                    thread_server = TSC.Server(SERVER, use_server_version=True)
+                    thread_auth = TSC.PersonalAccessTokenAuth(PAT_NAME, PAT_SECRET, SITE_ID)
+                    
+                    future = executor.submit(
+                        process_workbook_batch_with_auth,
+                        thread_server, thread_auth, batch, projects_by_id, users_by_id, ds_by_id
+                    )
+                    futures.append(future)
+                
+                # Collect results
+                for future in as_completed(futures):
+                    try:
+                        batch_rows = future.result()
+                        all_rows.extend(batch_rows)
+                    except Exception as e:
+                        print(f"\n⚠️ Error in thread: {e}")
+
+    except KeyboardInterrupt:
+        print(f"\n\n⚠️ Extraction interrupted by user!")
+        print(f"📊 Processed {progress_data['processed']:,} workbooks so far")
+        if len(all_rows) > 0:
+            print("💾 Saving partial results...")
+        else:
+            print("❌ No data to save")
+            return
+
+    # Save results
+    print(f"\n\n" + "="*60)
+    print("💾 SAVING RESULTS")
+    print("="*60)
+    
+    output_path = os.path.abspath(OUTPUT_CSV)
+    
+    if len(all_rows) > 0:
+        df = pd.DataFrame(all_rows)
+        df_sorted = df.sort_values(
+            ["project_name", "workbook_name", "view_name"], na_position="last"
+        )
+        df_sorted.to_csv(output_path, index=False)
+
+        # Summary statistics
+        total_projects = df['project_id'].nunique()
+        total_workbooks_found = df['workbook_id'].nunique()
+        total_views = len(df[df['view_id'].notna()])
+        
+        end_time = datetime.now()
+        duration = end_time - start_time
+
+        print("="*60)
+        print("🎉 EXTRACTION COMPLETED!")
+        print("="*60)
+        print(f"📊 SUMMARY:")
+        print(f"   🗂️  Projects: {total_projects:,}")
+        print(f"   📚 Workbooks: {total_workbooks_found:,}")
+        print(f"   📄 Views: {total_views:,}")
+        print(f"   👥 Users: {len(users_by_id):,}")
+        print(f"   ⏱️  Duration: {duration}")
+        print(f"   📁 Output: {output_path}")
+
+        if DOWNLOAD_VIEW_CSV:
+            print(f"   📂 Per-view CSVs: {os.path.abspath(VIEW_CSV_DIR)}")
+
+        # Open in Excel
+        print(f"\n🚀 Opening Excel...")
+        open_excel(output_path)
+        if DOWNLOAD_VIEW_CSV:
+            open_folder(os.path.abspath(VIEW_CSV_DIR))
+    else:
+        print("❌ No data was extracted!")
+
+def process_workbook_batch_with_auth(server, auth, workbooks_batch, projects_by_id, users_by_id, ds_by_id):
+    """Process workbook batch with authentication"""
+    try:
+        with server.auth.sign_in(auth):
+            return process_workbook_batch(server, workbooks_batch, projects_by_id, users_by_id, ds_by_id)
+    except Exception as e:
+        print(f"\n⚠️ Authentication error in thread: {e}")
+        return []
+
+if __name__ == "__main__":
+    main()
