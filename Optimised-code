@@ -1,1 +1,895 @@
-#code
+# tableau_inventory_final.py
+import os
+import sys
+import subprocess
+import pandas as pd
+import tableauserverclient as TSC
+from datetime import datetime
+import time
+from collections import defaultdict
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+import logging
+import traceback
+import signal
+
+# ===== EDIT THESE =====
+SERVER      = "https://mytableau.cvs.com"   # Root URL (no '/#/')
+SITE_ID     = "RX_OPS"                      # e.g., RX_OPS
+PAT_NAME    = "xxxxxxx"
+PAT_SECRET  = "xxxxxx"
+
+OUTPUT_CSV        = "tableau_inventory_final.csv"
+DOWNLOAD_VIEW_CSV = False                   # True = export underlying data CSVs for each view (needs permission)
+VIEW_CSV_DIR      = "view_csvs"
+PAGE_SIZE         = 50                      # Optimized page size
+REQUEST_TIMEOUT   = 180                     # 3 minutes timeout per request
+MAX_RETRIES       = 2                       # Number of retries for failed requests
+RETRY_DELAY       = 3                       # Seconds to wait between retries
+CHECKPOINT_INTERVAL = 25                    # Save progress every N workbooks
+# ======================
+
+# Set up comprehensive logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('tableau_inventory_final.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# Global variables for graceful shutdown and data persistence
+interrupted = False
+processed_workbooks = 0
+all_rows = []
+start_time = None
+
+def signal_handler(signum, frame):
+    """Enhanced signal handler for graceful shutdown with immediate data saving"""
+    global interrupted, all_rows, start_time
+    
+    if interrupted:
+        # Second Ctrl+C - force exit with emergency save
+        logger.warning("\n💥 FORCE EXIT - Performing emergency save...")
+        emergency_save()
+        print("\n🚨 EMERGENCY EXIT COMPLETED - Check emergency save file!")
+        sys.exit(1)
+    
+    interrupted = True
+    logger.warning(f"\n🛑 GRACEFUL SHUTDOWN INITIATED (Signal {signum})")
+    logger.warning("🔄 Finishing current workbook and saving all collected data...")
+    logger.warning("⚠️  Press Ctrl+C AGAIN to force immediate exit with emergency save")
+    
+    # Immediate partial save when first interrupt detected
+    if all_rows:
+        logger.info(f"💾 Immediate save: {len(all_rows)} rows collected so far...")
+        partial_save()
+
+def emergency_save():
+    """Emergency save function for critical situations"""
+    global all_rows
+    try:
+        if all_rows:
+            emergency_file = f"tableau_inventory_EMERGENCY_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+            df = pd.DataFrame(all_rows)
+            df.to_csv(emergency_file, index=False)
+            print(f"💾 EMERGENCY SAVE COMPLETED: {os.path.abspath(emergency_file)}")
+            logger.error(f"💾 EMERGENCY SAVE COMPLETED: {emergency_file}")
+            
+            # Try to open in Excel
+            try:
+                open_excel(os.path.abspath(emergency_file))
+            except:
+                pass
+        else:
+            print("⚠️ No data to emergency save")
+    except Exception as e:
+        print(f"❌ Emergency save failed: {e}")
+        logger.error(f"❌ Emergency save failed: {e}")
+
+def partial_save():
+    """Save partial results with comprehensive statistics"""
+    global all_rows, processed_workbooks, start_time
+    try:
+        if all_rows:
+            partial_file = f"tableau_inventory_PARTIAL_{processed_workbooks}wb_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+            df = pd.DataFrame(all_rows)
+            df_sorted = df.sort_values(
+                ["project_name", "workbook_name", "view_name"], na_position="last"
+            )
+            df_sorted.to_csv(partial_file, index=False)
+            
+            # Calculate comprehensive statistics
+            total_projects = df['project_id'].nunique()
+            total_workbooks_found = df['workbook_id'].nunique()
+            total_views = len(df[df['view_id'].notna()])
+            owner_names_found = len(df[(df['owner_name'].notna()) & 
+                                     (~df['owner_name'].str.startswith('User ID:')) & 
+                                     (df['owner_name'] != 'Permission Denied')]['workbook_id'].unique())
+            duration = datetime.now() - start_time if start_time else "Unknown"
+            
+            logger.warning("="*60)
+            logger.warning("💾 PARTIAL RESULTS SAVED!")
+            logger.warning("="*60)
+            logger.warning(f"📊 PARTIAL SUMMARY:")
+            logger.warning(f"   🗂️  Projects: {total_projects:,}")
+            logger.warning(f"   📚 Workbooks: {total_workbooks_found:,}")
+            logger.warning(f"   📄 Views: {total_views:,}")
+            logger.warning(f"   👤 Owner Names Found: {owner_names_found:,}/{total_workbooks_found:,}")
+            logger.warning(f"   ⏱️  Duration so far: {duration}")
+            logger.warning(f"   📁 Partial File: {os.path.abspath(partial_file)}")
+            logger.warning("="*60)
+            
+            # Also save to the main output file for continuity
+            try:
+                main_output = os.path.abspath(OUTPUT_CSV)
+                df_sorted.to_csv(main_output, index=False)
+                logger.warning(f"📁 Also saved to main file: {main_output}")
+            except Exception as e:
+                logger.warning(f"⚠️ Could not save to main file: {e}")
+                
+            return partial_file
+    except Exception as e:
+        logger.error(f"❌ Partial save failed: {e}")
+        logger.error(traceback.format_exc())
+    return None
+
+# Register enhanced signal handlers
+signal.signal(signal.SIGINT, signal_handler)
+if hasattr(signal, 'SIGTERM'):
+    signal.signal(signal.SIGTERM, signal_handler)
+
+def print_progress_bar(current, total, prefix='Progress', suffix='Complete', length=50, fill='█'):
+    """Enhanced progress bar with logging"""
+    if total == 0:
+        return
+    percent = f"{100 * (current / float(total)):.1f}"
+    filled_length = int(length * current // total)
+    bar = fill * filled_length + '-' * (length - filled_length)
+    message = f'\r{prefix} |{bar}| {percent}% {suffix} ({current}/{total})'
+    print(message, end='', flush=True)
+    
+    # Log progress every 10% or every 50 items
+    if current % max(1, total // 10) == 0 or current % 50 == 0 or current == total:
+        logger.info(message.strip())
+    
+    if current == total:
+        print()
+
+def save_checkpoint(rows, checkpoint_num):
+    """Enhanced checkpoint saving with better error handling"""
+    if not rows:
+        return None
+    
+    checkpoint_file = f"tableau_inventory_checkpoint_{checkpoint_num}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+    try:
+        df = pd.DataFrame(rows)
+        df_sorted = df.sort_values(
+            ["project_name", "workbook_name", "view_name"], na_position="last"
+        )
+        df_sorted.to_csv(checkpoint_file, index=False)
+        
+        # Quick stats
+        total_workbooks = df['workbook_id'].nunique()
+        total_views = len(df[df['view_id'].notna()])
+        
+        logger.info(f"💾 Checkpoint {checkpoint_num} saved: {checkpoint_file}")
+        logger.info(f"   📊 {len(rows)} rows, {total_workbooks} workbooks, {total_views} views")
+        return checkpoint_file
+    except Exception as e:
+        logger.error(f"❌ Failed to save checkpoint {checkpoint_num}: {e}")
+        return None
+
+def link_for_view(server_base, site_id, content_url):
+    """Generate view URL"""
+    return f"{server_base}/#/site/{site_id}/views/{content_url}"
+
+def link_for_workbook(server_base, site_id, content_url):
+    """Generate workbook URL"""
+    return f"{server_base}/#/site/{site_id}/workbooks/{content_url}"
+
+def has_more(pagination):
+    """Check if more pages available"""
+    return pagination.page_number * pagination.page_size < pagination.total_available
+
+def configure_server_with_timeout(server_url, timeout=REQUEST_TIMEOUT):
+    """Configure Tableau Server with optimized timeout and retry settings"""
+    server = TSC.Server(server_url, use_server_version=True)
+    
+    # Configure requests session with comprehensive timeout and retry handling
+    session = requests.Session()
+    
+    # Enhanced retry strategy
+    retry_strategy = Retry(
+        total=MAX_RETRIES,
+        status_forcelist=[429, 500, 502, 503, 504],
+        backoff_factor=2,
+        raise_on_status=False
+    )
+    
+    adapter = HTTPAdapter(max_retries=retry_strategy)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    
+    # Enhanced timeout configuration
+    original_request = session.request
+    def request_with_timeout(*args, **kwargs):
+        kwargs.setdefault('timeout', timeout)
+        return original_request(*args, **kwargs)
+    session.request = request_with_timeout
+    
+    # Apply to server
+    server._session = session
+    
+    return server
+
+def safe_api_call(func, *args, **kwargs):
+    """Enhanced API call wrapper with comprehensive error handling"""
+    global interrupted
+    
+    if interrupted:
+        raise KeyboardInterrupt("Process was interrupted")
+    
+    last_exception = None
+    
+    for attempt in range(MAX_RETRIES + 1):
+        try:
+            return func(*args, **kwargs)
+        except KeyboardInterrupt:
+            raise
+        except (requests.exceptions.Timeout, requests.exceptions.ReadTimeout, 
+                requests.exceptions.ConnectionError) as e:
+            last_exception = e
+            if attempt < MAX_RETRIES:
+                logger.warning(f"⚠️ Network error (attempt {attempt + 1}/{MAX_RETRIES + 1}): {str(e)[:100]}...")
+                logger.warning(f"   Retrying in {RETRY_DELAY} seconds...")
+                time.sleep(RETRY_DELAY)
+            else:
+                logger.error(f"❌ Network error after {MAX_RETRIES + 1} attempts")
+                raise last_exception
+        except Exception as e:
+            last_exception = e
+            error_msg = str(e).lower()
+            if "unauthorized" in error_msg or "permission" in error_msg:
+                logger.error(f"❌ Permission error: {str(e)[:200]}")
+                logger.error("   This might be a permissions issue - continuing with available data")
+            else:
+                logger.error(f"❌ Unexpected API error: {type(e).__name__}: {str(e)[:200]}")
+            raise last_exception
+
+def open_excel(filepath):
+    """Enhanced file opening with cross-platform support"""
+    try:
+        abs_path = os.path.abspath(filepath)
+        if sys.platform.startswith("win"):
+            subprocess.Popen(["excel.exe", abs_path], shell=True)
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", "-a", "Microsoft Excel", abs_path])
+        else:
+            subprocess.Popen(["xdg-open", abs_path])
+        logger.info(f"✅ Opened file in Excel: {abs_path}")
+    except Exception as e:
+        logger.warning(f"⚠️ Could not open in Excel: {e}")
+
+def open_folder(path):
+    """Enhanced folder opening with cross-platform support"""
+    try:
+        abs_path = os.path.abspath(path)
+        if sys.platform.startswith("win"):
+            subprocess.Popen(["explorer", abs_path])
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", abs_path])
+        else:
+            subprocess.Popen(["xdg-open", abs_path])
+        logger.info(f"✅ Opened folder: {abs_path}")
+    except Exception as e:
+        logger.warning(f"⚠️ Could not open folder: {e}")
+
+def fetch_paginated_data(server, endpoint_func, name, req_options=None):
+    """Enhanced paginated data fetching with interruption handling"""
+    global interrupted
+    
+    logger.info(f"📥 Fetching {name}...")
+    
+    if req_options is None:
+        req_options = TSC.RequestOptions()
+        req_options.page_size = PAGE_SIZE
+    
+    all_items = []
+    item_count = 0
+    total_items = 0
+    
+    while not interrupted:
+        try:
+            items, pagination = safe_api_call(endpoint_func, req_options=req_options)
+            
+            if total_items == 0:
+                total_items = pagination.total_available
+                logger.info(f"📊 Total {name} to fetch: {total_items:,}")
+            
+            all_items.extend(items)
+            item_count += len(items)
+            
+            if total_items > 0:
+                print_progress_bar(item_count, total_items, prefix=name, suffix='fetched')
+            
+            if has_more(pagination):
+                req_options.page_number = pagination.page_number + 1
+                time.sleep(0.2)  # Optimized delay
+            else:
+                break
+                
+        except KeyboardInterrupt:
+            logger.warning(f"⚠️ Interrupted while fetching {name}")
+            break
+        except Exception as e:
+            logger.error(f"❌ Error fetching {name}: {e}")
+            break
+    
+    logger.info(f"✅ Successfully fetched {len(all_items):,} {name}")
+    return all_items
+
+def extract_owner_from_workbook(wb):
+    """Enhanced owner information extraction"""
+    owner_info = {
+        'owner_id': getattr(wb, 'owner_id', None),
+        'owner_name': None,
+        'owner_email': None
+    }
+    
+    # Try multiple methods to get owner name
+    try:
+        # Method 1: Direct attributes
+        if hasattr(wb, 'owner_name'):
+            owner_info['owner_name'] = wb.owner_name
+        elif hasattr(wb, '_owner_name'):
+            owner_info['owner_name'] = wb._owner_name
+        
+        # Method 2: XML element parsing
+        if hasattr(wb, '_xml_element') and wb._xml_element is not None:
+            owner_element = wb._xml_element.find('.//owner')
+            if owner_element is not None:
+                owner_info['owner_name'] = owner_element.get('name')
+                owner_info['owner_email'] = owner_element.get('email')
+                
+    except Exception as e:
+        logger.debug(f"Could not extract owner info for {getattr(wb, 'name', 'unknown')}: {e}")
+    
+    # Fallback to owner_id if no name found
+    if not owner_info['owner_name'] and owner_info['owner_id']:
+        owner_info['owner_name'] = f"User ID: {owner_info['owner_id']}"
+    
+    return owner_info
+
+def fetch_projects_safe(server):
+    """Enhanced project fetching with error handling"""
+    try:
+        projects = fetch_paginated_data(server, server.projects.get, "projects")
+        projects_by_id = {project.id: project for project in projects}
+        logger.info(f"✅ Loaded {len(projects_by_id)} projects into lookup")
+        return projects_by_id
+    except Exception as e:
+        logger.warning(f"⚠️ Could not fetch projects: {e}")
+        return {}
+
+def fetch_datasources_safe(server):
+    """Enhanced datasource fetching with error handling"""
+    try:
+        datasources = fetch_paginated_data(server, server.datasources.get, "datasources")
+        ds_by_id = {ds.id: ds for ds in datasources}
+        logger.info(f"✅ Loaded {len(ds_by_id)} datasources into lookup")
+        return ds_by_id
+    except Exception as e:
+        logger.warning(f"⚠️ Could not fetch datasources: {e}")
+        return {}
+
+def fetch_workbooks_safe(server):
+    """Enhanced workbook fetching with error handling"""
+    try:
+        workbooks = fetch_paginated_data(server, server.workbooks.get, "workbooks")
+        logger.info(f"✅ Loaded {len(workbooks)} workbooks for processing")
+        return workbooks
+    except Exception as e:
+        logger.warning(f"⚠️ Could not fetch workbooks: {e}")
+        return []
+
+def get_workbook_owner_names_from_views(server, workbook_ids):
+    """Enhanced owner name extraction from views"""
+    logger.info("🔍 Attempting to get owner info from views...")
+    owner_cache = {}
+    
+    if not workbook_ids:
+        return owner_cache
+    
+    try:
+        # Get views with usage statistics
+        req = TSC.RequestOptions()
+        req.page_size = PAGE_SIZE
+        req.include_usage_statistics = True
+        
+        view_count = 0
+        total_views = 0
+        
+        while not interrupted:
+            try:
+                views, pagination = safe_api_call(server.views.get, req_options=req)
+                
+                if total_views == 0:
+                    total_views = pagination.total_available
+                
+                for view in views:
+                    wb_id = getattr(view, 'workbook_id', None)
+                    if wb_id in workbook_ids and wb_id not in owner_cache:
+                        # Try to extract owner info from view XML
+                        try:
+                            if hasattr(view, '_xml_element') and view._xml_element is not None:
+                                wb_element = view._xml_element.find('.//workbook')
+                                if wb_element is not None:
+                                    owner_element = wb_element.find('.//owner')
+                                    if owner_element is not None:
+                                        owner_name = owner_element.get('name')
+                                        if owner_name:
+                                            owner_cache[wb_id] = owner_name
+                        except:
+                            pass
+                
+                view_count += len(views)
+                if total_views > 0:
+                    print_progress_bar(view_count, total_views, 
+                                     prefix='Views analyzed', suffix='for owners')
+                
+                if has_more(pagination):
+                    req.page_number = pagination.page_number + 1
+                    time.sleep(0.1)
+                else:
+                    break
+                    
+            except KeyboardInterrupt:
+                logger.warning("⚠️ Interrupted while analyzing views for owner info")
+                break
+            except Exception as e:
+                logger.warning(f"⚠️ Error getting views for owner info: {e}")
+                break
+                
+    except Exception as e:
+        logger.warning(f"⚠️ Could not get owner info from views: {e}")
+    
+    logger.info(f"✅ Found owner names for {len(owner_cache)} workbooks from views")
+    return owner_cache
+
+def process_single_workbook(server, wb, projects_by_id, ds_by_id, owner_cache=None):
+    """Enhanced single workbook processing with comprehensive error handling"""
+    global interrupted
+    
+    if interrupted:
+        return []
+    
+    rows = []
+    
+    # Skip known problematic workbooks (add names here if needed)
+    SKIP_WORKBOOKS = []  # e.g., ["Problem Workbook 1", "Large Dashboard"]
+    if wb.name in SKIP_WORKBOOKS:
+        logger.info(f"⏭️ Skipping known problematic workbook: {wb.name}")
+        return [{
+            "project_name": None,
+            "workbook_name": wb.name,
+            "workbook_id": wb.id,
+            "owner_name": "SKIPPED - Known Issue",
+            "view_name": "SKIPPED",
+            **{k: None for k in ["project_id", "workbook_url", "workbook_created", 
+                               "workbook_updated", "owner_id", "owner_email", "view_id", 
+                               "view_url", "view_total_views", "datasource_names", 
+                               "datasource_types", "saved_view_csv"]}
+        }]
+    
+    try:
+        # Get basic workbook info
+        proj = projects_by_id.get(wb.project_id)
+        owner_info = extract_owner_from_workbook(wb)
+        
+        # Use cached owner info if available
+        if owner_cache and wb.id in owner_cache:
+            owner_info['owner_name'] = owner_cache[wb.id]
+        
+        wb_url = link_for_workbook(SERVER, SITE_ID, wb.content_url)
+        
+        # Enhanced view fetching with timeout protection
+        views = []
+        try:
+            safe_api_call(server.workbooks.populate_views, wb)
+            views = getattr(wb, "views", [])
+        except Exception as e:
+            logger.debug(f"Could not get views for workbook '{wb.name}': {e}")
+            views = []
+
+        # Enhanced connection fetching with timeout protection
+        connections = []
+        try:
+            safe_api_call(server.workbooks.populate_connections, wb)
+            connections = getattr(wb, "connections", [])
+        except Exception as e:
+            logger.debug(f"Could not get connections for workbook '{wb.name}': {e}")
+            connections = []
+
+        # Process datasource info
+        ds_names, ds_types = [], []
+        for c in connections:
+            ds_obj = ds_by_id.get(getattr(c, "datasource_id", None))
+            if ds_obj:
+                ds_names.append(ds_obj.name or "")
+                ds_types.append(ds_obj.connection_type or "")
+            else:
+                ds_names.append(getattr(c, "server_address", "") or "embedded/unknown")
+                ds_types.append(getattr(c, "connection_type", "") or "unknown")
+
+        # Enhanced view processing
+        if views:
+            for v in views:
+                if interrupted:
+                    break
+                    
+                try:
+                    v_url = link_for_view(SERVER, SITE_ID, v.content_url)
+                    total_views = getattr(v, "total_views", None)
+
+                    # Optional CSV download (disabled by default to prevent timeouts)
+                    saved_csv_path = None
+                    if DOWNLOAD_VIEW_CSV:
+                        try:
+                            os.makedirs(VIEW_CSV_DIR, exist_ok=True)
+                            csv_bytes = safe_api_call(server.views.populate_csv, v)
+                            safe_name = f"{(proj.name if proj else 'NoProject')}__{wb.name}__{v.name}".replace("/", "_").replace("\\", "_")
+                            saved_csv_path = os.path.join(VIEW_CSV_DIR, f"{safe_name}.csv")
+                            with open(saved_csv_path, "wb") as f:
+                                f.write(csv_bytes)
+                        except Exception as e:
+                            saved_csv_path = f"ERROR: {str(e)[:100]}"
+                    else:
+                        saved_csv_path = "DISABLED"
+
+                    rows.append({
+                        "project_name":      proj.name if proj else None,
+                        "project_id":        wb.project_id,
+                        "workbook_name":     wb.name,
+                        "workbook_id":       wb.id,
+                        "workbook_url":      wb_url,
+                        "workbook_created":  getattr(wb, "created_at", None),
+                        "workbook_updated":  getattr(wb, "updated_at", None),
+                        "owner_id":          owner_info['owner_id'],
+                        "owner_name":        owner_info['owner_name'] or "Permission Denied",
+                        "owner_email":       owner_info['owner_email'],
+                        "view_name":         v.name,
+                        "view_id":           v.id,
+                        "view_url":          v_url,
+                        "view_total_views":  total_views,
+                        "datasource_names":  "; ".join(sorted(set(n for n in ds_names if n))),
+                        "datasource_types":  "; ".join(sorted(set(t for t in ds_types if t))),
+                        "saved_view_csv":    saved_csv_path
+                    })
+                except Exception as e:
+                    logger.debug(f"Error processing view '{v.name}' in workbook '{wb.name}': {e}")
+        else:
+            # Workbook with no views
+            rows.append({
+                "project_name":      proj.name if proj else None,
+                "project_id":        wb.project_id,
+                "workbook_name":     wb.name,
+                "workbook_id":       wb.id,
+                "workbook_url":      wb_url,
+                "workbook_created":  getattr(wb, "created_at", None),
+                "workbook_updated":  getattr(wb, "updated_at", None),
+                "owner_id":          owner_info['owner_id'],
+                "owner_name":        owner_info['owner_name'] or "Permission Denied",
+                "owner_email":       owner_info['owner_email'],
+                "view_name":         None,
+                "view_id":           None,
+                "view_url":          None,
+                "view_total_views":  None,
+                "datasource_names":  "; ".join(sorted(set(n for n in ds_names if n))),
+                "datasource_types":  "; ".join(sorted(set(t for t in ds_types if t))),
+                "saved_view_csv":    None
+            })
+
+    except Exception as e:
+        logger.warning(f"⚠️ Error processing workbook '{wb.name}': {e}")
+        # Create comprehensive error record
+        try:
+            proj = projects_by_id.get(wb.project_id)
+            owner_info = extract_owner_from_workbook(wb)
+            wb_url = link_for_workbook(SERVER, SITE_ID, wb.content_url)
+            
+            rows.append({
+                "project_name":      proj.name if proj else None,
+                "project_id":        wb.project_id,
+                "workbook_name":     wb.name,
+                "workbook_id":       wb.id,
+                "workbook_url":      wb_url,
+                "workbook_created":  getattr(wb, "created_at", None),
+                "workbook_updated":  getattr(wb, "updated_at", None),
+                "owner_id":          owner_info['owner_id'],
+                "owner_name":        owner_info['owner_name'] or f"ERROR: {str(e)[:50]}",
+                "owner_email":       owner_info['owner_email'],
+                "view_name":         f"ERROR: {str(e)[:100]}",
+                "view_id":           None,
+                "view_url":          None,
+                "view_total_views":  None,
+                "datasource_names":  "ERROR",
+                "datasource_types":  "ERROR",
+                "saved_view_csv":    None
+            })
+        except Exception as inner_e:
+            logger.error(f"❌ Failed to create error record for workbook: {inner_e}")
+    
+    return rows
+
+def main():
+    """Enhanced main function with comprehensive error handling and data preservation"""
+    global processed_workbooks, all_rows, interrupted, start_time
+    
+    print("="*70)
+    print("🛡️ TABLEAU INVENTORY - FINAL COMBINED VERSION")
+    print("="*70)
+    print("🎯 FEATURES:")
+    print("   ✅ Comprehensive error handling and recovery")
+    print("   ✅ Automatic checkpoints every 25 workbooks") 
+    print("   ✅ Enhanced Ctrl+C protection with data preservation")
+    print("   ✅ Multiple owner name detection methods")
+    print("   ✅ Detailed logging and progress tracking")
+    print("   ✅ Cross-platform Excel integration")
+    print("="*70)
+    print("⚠️  CTRL+C HANDLING:")
+    print("   🔄 First Ctrl+C  = Graceful shutdown + save all data")
+    print("   💥 Second Ctrl+C = Emergency exit + immediate save")
+    print("="*70)
+    print(f"⚙️ CONFIGURATION:")
+    print(f"   📄 Page Size: {PAGE_SIZE}")
+    print(f"   ⏱️  Request Timeout: {REQUEST_TIMEOUT}s")
+    print(f"   🔄 Max Retries: {MAX_RETRIES}")
+    print(f"   ⏳ Retry Delay: {RETRY_DELAY}s")
+    print(f"   💾 Checkpoint Interval: {CHECKPOINT_INTERVAL}")
+    print(f"   📝 Log File: tableau_inventory_final.log")
+    print(f"   📊 CSV Download: {'ENABLED' if DOWNLOAD_VIEW_CSV else 'DISABLED (recommended)'}")
+    print("="*70)
+    
+    start_time = datetime.now()
+    logger.info(f"⏰ Started at: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+    
+    server = configure_server_with_timeout(SERVER)
+    auth = TSC.PersonalAccessTokenAuth(PAT_NAME, PAT_SECRET, SITE_ID)
+
+    try:
+        with server.auth.sign_in(auth):
+            logger.info(f"✅ Successfully connected to {SERVER}")
+
+            # Phase 1: Fetch reference data with interruption checking
+            logger.info("🔄 Phase 1: Fetching reference data...")
+            
+            if interrupted:
+                logger.warning("⚠️ Interrupted during connection setup")
+                partial_save()
+                return
+                
+            projects_by_id = fetch_projects_safe(server)
+            if interrupted:
+                logger.warning("⚠️ Interrupted during projects fetch")
+                partial_save()
+                return
+                
+            ds_by_id = fetch_datasources_safe(server)
+            if interrupted:
+                logger.warning("⚠️ Interrupted during datasources fetch") 
+                partial_save()
+                return
+                
+            workbooks = fetch_workbooks_safe(server)
+            if interrupted:
+                logger.warning("⚠️ Interrupted during workbooks fetch")
+                partial_save()
+                return
+            
+            logger.info(f"📊 Reference data summary:")
+            logger.info(f"   🗂️  Projects: {len(projects_by_id):,}")
+            logger.info(f"   💾 Datasources: {len(ds_by_id):,}")
+            logger.info(f"   📚 Workbooks: {len(workbooks):,}")
+            
+            if not workbooks:
+                logger.error("❌ No workbooks found. Exiting.")
+                return
+            
+            # Phase 2: Enhanced owner name detection
+            logger.info("🔄 Phase 2: Enhanced owner name detection...")
+            workbook_ids = {wb.id for wb in workbooks}
+            owner_cache = get_workbook_owner_names_from_views(server, workbook_ids)
+            
+            if interrupted:
+                logger.warning("⚠️ Interrupted during owner detection")
+                partial_save()
+                return
+
+            # Phase 3: Process workbooks with comprehensive tracking
+            logger.info("="*70)
+            logger.info("🔄 Phase 3: PROCESSING WORKBOOKS")
+            logger.info("="*70)
+            
+            total_workbooks = len(workbooks)
+            checkpoint_counter = 0
+            
+            for i, wb in enumerate(workbooks, 1):
+                if interrupted:
+                    logger.warning(f"🛑 Process interrupted at workbook {i}/{total_workbooks}")
+                    logger.warning(f"📝 Last workbook being processed: {wb.name}")
+                    break
+                
+                processed_workbooks = i
+                
+                # Enhanced progress display
+                print_progress_bar(i, total_workbooks, 
+                                 prefix='📚 Workbooks', suffix='processed')
+                
+                # Show current workbook name periodically for better tracking
+                if i % 5 == 0 or i == 1:
+                    logger.info(f"🔄 Processing #{i}/{total_workbooks}: {wb.name[:60]}...")
+                
+                # Process workbook with enhanced error handling
+                try:
+                    wb_rows = process_single_workbook(server, wb, projects_by_id, ds_by_id, owner_cache)
+                    all_rows.extend(wb_rows)
+                    
+                    # Immediate save check if interrupted during processing
+                    if interrupted and len(all_rows) > 0:
+                        logger.warning("🔄 Saving data due to interruption during workbook processing...")
+                        partial_save()
+                        break
+                        
+                except KeyboardInterrupt:
+                    logger.warning("⚠️ Interrupted during individual workbook processing")
+                    interrupted = True
+                    if len(all_rows) > 0:
+                        partial_save()
+                    break
+                except Exception as e:
+                    logger.error(f"❌ Fatal error processing workbook '{wb.name}': {e}")
+                    logger.error(traceback.format_exc())
+                    # Continue processing other workbooks - don't let one bad workbook stop everything
+                
+                # Enhanced checkpoint saving with progress tracking
+                if i % CHECKPOINT_INTERVAL == 0:
+                    checkpoint_counter += 1
+                    checkpoint_file = save_checkpoint(all_rows, checkpoint_counter)
+                    if checkpoint_file:
+                        logger.info(f"✅ Checkpoint {checkpoint_counter} completed")
+                        if interrupted:
+                            logger.warning("🛑 Stopping due to interruption after checkpoint")
+                            break
+                
+                # Optimized pause to prevent overwhelming the server
+                time.sleep(0.1)
+                
+                # Final interruption check
+                if interrupted:
+                    logger.warning(f"🛑 Graceful shutdown completed after processing workbook {i}")
+                    break
+
+    except KeyboardInterrupt:
+        logger.warning(f"\n⚠️ Extraction interrupted by user during main processing!")
+        interrupted = True
+    except Exception as e:
+        logger.error(f"❌ Unexpected error during main processing: {e}")
+        logger.error(traceback.format_exc())
+        interrupted = True
+
+    # Phase 4: Final results processing and saving
+    logger.info("="*70)
+    if interrupted:
+        logger.info("🔶 Phase 4: SAVING INTERRUPTED RESULTS")
+    else:
+        logger.info("🎉 Phase 4: SAVING FINAL RESULTS")
+    logger.info("="*70)
+    
+    final_output_path = os.path.abspath(OUTPUT_CSV)
+    
+    if len(all_rows) > 0:
+        try:
+            # Create comprehensive final dataset
+            df = pd.DataFrame(all_rows)
+            df_sorted = df.sort_values(
+                ["project_name", "workbook_name", "view_name"], na_position="last"
+            )
+            df_sorted.to_csv(final_output_path, index=False)
+
+            # Calculate comprehensive statistics
+            total_projects = df['project_id'].nunique()
+            total_workbooks_found = df['workbook_id'].nunique()
+            total_views = len(df[df['view_id'].notna()])
+            
+            # Enhanced owner name analysis
+            owner_names_found = len(df[(df['owner_name'].notna()) & 
+                                     (~df['owner_name'].str.startswith('User ID:')) & 
+                                     (df['owner_name'] != 'Permission Denied') &
+                                     (~df['owner_name'].str.startswith('ERROR:'))]['workbook_id'].unique())
+            
+            permission_denied = len(df[df['owner_name'] == 'Permission Denied']['workbook_id'].unique())
+            user_id_only = len(df[df['owner_name'].str.startswith('User ID:', na=False)]['workbook_id'].unique())
+            
+            end_time = datetime.now()
+            duration = end_time - start_time
+
+            logger.info("="*70)
+            if interrupted:
+                logger.info("🔶 PARTIAL EXTRACTION COMPLETED!")
+                logger.info(f"⚠️  Process was interrupted - results are PARTIAL but COMPLETE for processed workbooks")
+            else:
+                logger.info("🎉 FULL EXTRACTION COMPLETED SUCCESSFULLY!")
+            logger.info("="*70)
+            
+            logger.info(f"📊 COMPREHENSIVE SUMMARY:")
+            logger.info(f"   🗂️  Projects discovered: {total_projects:,}")
+            logger.info(f"   📚 Workbooks processed: {total_workbooks_found:,}")
+            logger.info(f"   📄 Views catalogued: {total_views:,}")
+            logger.info(f"   👤 Owner names found: {owner_names_found:,}")
+            logger.info(f"   🔒 Permission denied: {permission_denied:,}")
+            logger.info(f"   🆔 User ID only: {user_id_only:,}")
+            logger.info(f"   ⏱️  Total duration: {duration}")
+            logger.info(f"   📁 Final output: {final_output_path}")
+            
+            if interrupted:
+                logger.info(f"   📊 Workbooks processed: {processed_workbooks:,}/{len(workbooks):,}")
+                completion_rate = (processed_workbooks/len(workbooks)*100) if workbooks else 0
+                logger.info(f"   📈 Completion rate: {completion_rate:.1f}%")
+                logger.info(f"   🔄 You can resume from workbook #{processed_workbooks + 1} if needed")
+
+            # Enhanced completion message based on results
+            if owner_names_found < total_workbooks_found * 0.5:
+                logger.warning(f"📝 NOTE: Only {owner_names_found}/{total_workbooks_found} workbooks have owner names")
+                logger.warning(f"   This is likely due to insufficient user query permissions")
+                logger.warning(f"   Consider requesting 'View' permissions for users if owner names are needed")
+
+            if DOWNLOAD_VIEW_CSV and total_views > 0:
+                logger.info(f"   📂 View CSVs directory: {os.path.abspath(VIEW_CSV_DIR)}")
+
+            # Cross-platform Excel opening
+            logger.info("🚀 Opening results in Excel...")
+            open_excel(final_output_path)
+            
+            if DOWNLOAD_VIEW_CSV and os.path.exists(VIEW_CSV_DIR):
+                logger.info("📂 Opening view CSVs folder...")
+                open_folder(os.path.abspath(VIEW_CSV_DIR))
+            
+        except Exception as e:
+            logger.error(f"❌ Error saving final results: {e}")
+            logger.error(traceback.format_exc())
+            # Attempt emergency save as last resort
+            logger.warning("🚨 Attempting emergency save...")
+            emergency_save()
+    else:
+        logger.error("❌ No data was extracted!")
+        logger.error("   Check the log file for detailed error information")
+        logger.error("   Verify your credentials and permissions")
+        
+    # Final status message
+    if interrupted:
+        logger.warning("="*70)
+        logger.warning("✅ GRACEFUL SHUTDOWN COMPLETED SUCCESSFULLY")
+        logger.warning("✅ All collected data has been saved safely!")
+        logger.warning("💡 TIP: You can restart the script to continue from where you left off")
+        logger.warning("="*70)
+    else:
+        logger.info("="*70)
+        logger.info("🏁 TABLEAU INVENTORY EXTRACTION COMPLETED!")
+        logger.info("✅ All data successfully extracted and saved!")
+        logger.info("="*70)
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:
+        logger.critical(f"💥 CRITICAL ERROR: {e}")
+        logger.critical(traceback.format_exc())
+        # Final emergency save attempt
+        if all_rows:
+            logger.critical("🚨 Attempting final emergency save...")
+            emergency_save()
+        sys.exit(1)
