@@ -15,8 +15,8 @@ from urllib3.util.retry import Retry
 # ===== EDIT THESE =====
 SERVER      = "https://mytableau.cvs.com"   # Root URL (no '/#/')
 SITE_ID     = "RX_OPS"                      # e.g., RX_OPS
-PAT_NAME    = "xxxxx"
-PAT_SECRET  = "xxxxxxxxxx"
+PAT_NAME    = "xxxxxxx"
+PAT_SECRET  = "xxxxxx"
 
 OUTPUT_CSV        = "tableau_inventory_no_users.csv"
 DOWNLOAD_VIEW_CSV = False                   # True = export underlying data CSVs for each view (needs permission)
