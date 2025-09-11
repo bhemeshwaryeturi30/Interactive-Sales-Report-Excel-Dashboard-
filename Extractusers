@@ -1,0 +1,241 @@
+# scrape_tableau_views_owners.py
+# Purpose: Scrape "View Name" and "Owner" from Tableau Explore ▸ All Views WITHOUT using the API.
+
+import time
+import pandas as pd
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from webdriver_manager.chrome import ChromeDriverManager
+from selenium.webdriver.chrome.service import Service as ChromeService
+from selenium.webdriver.chrome.options import Options
+
+# ========== EDIT THESE ==========
+SERVER   = "https://mytableau.cvs.com"   # no trailing '/#/'
+SITE_ID  = "RX_OPS"                      # must match /site/<value>/ in URLs
+OUTPUT   = "tableau_views_owners.csv"
+HEADLESS = False                         # True = no browser window (if SSO prompts, use False)
+# =================================
+
+def open_driver():
+    opts = Options()
+    if HEADLESS:
+        opts.add_argument("--headless=new")
+    opts.add_argument("--start-maximized")
+    opts.add_argument("--disable-gpu")
+    opts.add_argument("--window-size=1600,1000")
+    # keep automation flags minimal to avoid SSO issues
+    driver = webdriver.Chrome(service=ChromeService(ChromeDriverManager().install()), options=opts)
+    return driver
+
+def goto_all_views(driver):
+    # Several Tableau versions accept different query params for Explore.
+    candidate_urls = [
+        f"{SERVER}/#/site/{SITE_ID}/explore?view=views",
+        f"{SERVER}/#/site/{SITE_ID}/explore?contentType=views",
+        f"{SERVER}/#/site/{SITE_ID}/explore?type=views",
+        f"{SERVER}/#/site/{SITE_ID}/explore"
+    ]
+    for url in candidate_urls:
+        driver.get(url)
+        time.sleep(2)
+        # Wait for either grid header or the grid rows to appear
+        try:
+            WebDriverWait(driver, 20).until(
+                EC.any_of(
+                    EC.presence_of_element_located((By.CSS_SELECTOR, '[role="columnheader"]')),
+                    EC.presence_of_element_located((By.CSS_SELECTOR, '[role="row"]'))
+                )
+            )
+            return
+        except Exception:
+            continue
+    raise RuntimeError("Could not open Explore page / grid did not render")
+
+def ensure_all_views_mode(driver):
+    """
+    If the Explore dropdown is visible, try to switch to All Views.
+    We do this by looking for a control that contains 'All Views' text.
+    If not found, we assume the URL already shows views.
+    """
+    try:
+        # Open the type dropdown if present
+        # Buttons often have aria-label or text like 'Top-Level Projects', 'All Views', etc.
+        # Scan for a button that opens a menu
+        candidates = driver.find_elements(By.CSS_SELECTOR, "button, div[role='button']")
+        for el in candidates:
+            txt = (el.text or "").strip().lower()
+            if not txt:
+                continue
+            if "views" in txt or "projects" in txt or "workbooks" in txt:
+                try:
+                    el.click()
+                    time.sleep(0.5)
+                    # In the menu, click the 'All Views' item if present
+                    menu_items = driver.find_elements(By.XPATH, "//*[self::div or self::span or self::a][contains(translate(text(),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'all views')]")
+                    if menu_items:
+                        menu_items[0].click()
+                        time.sleep(1.0)
+                        break
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+def locate_header_indexes(driver):
+    """
+    Return (name_idx, owner_idx) for grid cells by reading the column headers.
+    Falls back to common defaults if header text not found.
+    """
+    headers = driver.find_elements(By.CSS_SELECTOR, '[role="columnheader"]')
+    name_idx, owner_idx = None, None
+    for i, h in enumerate(headers):
+        label = (h.text or "").strip().lower()
+        if label == "name":
+            name_idx = i
+        if label == "owner":
+            owner_idx = i
+    # Fallbacks (common order: Name, Type, Owner, Project, …)
+    if name_idx is None:
+        name_idx = 0
+    if owner_idx is None:
+        # Attempt to find column with owner aria-label
+        for i, h in enumerate(headers):
+            aria = (h.get_attribute("aria-label") or "").lower()
+            if "owner" in aria:
+                owner_idx = i
+                break
+    if owner_idx is None:
+        owner_idx = 2  # heuristic
+    return name_idx, owner_idx
+
+def extract_rows_on_current_screen(driver, name_idx, owner_idx):
+    """
+    Parse all currently rendered rows (Tableau often virtualizes the grid).
+    Returns list of (view_name, owner, view_url).
+    """
+    data = []
+    rows = driver.find_elements(By.CSS_SELECTOR, '[role="row"]')
+    for r in rows:
+        cells = r.find_elements(By.CSS_SELECTOR, '[role="gridcell"]')
+        if len(cells) <= max(name_idx, owner_idx):
+            continue
+        # Name cell usually contains a link
+        view_cell = cells[name_idx]
+        owner_cell = cells[owner_idx]
+
+        view_name = (view_cell.text or "").strip()
+        owner     = (owner_cell.text or "").strip()
+
+        # Try to grab the URL from any anchor inside the name cell
+        view_url = ""
+        try:
+            a = view_cell.find_element(By.CSS_SELECTOR, "a")
+            view_url = a.get_attribute("href") or ""
+        except Exception:
+            pass
+
+        # Filter out header/empty lines
+        if view_name and owner and view_name.lower() != "name":
+            data.append((view_name, owner, view_url))
+    return data
+
+def try_next_page(driver):
+    """
+    Click 'Next' pagination button if it exists and is enabled.
+    Returns True if it navigated, False otherwise.
+    """
+    try:
+        next_btns = driver.find_elements(By.XPATH, "//button[contains(@aria-label,'Next') or contains(@title,'Next')]")
+        for b in next_btns:
+            disabled = (b.get_attribute("disabled") is not None) or ("disabled" in (b.get_attribute("class") or "").lower())
+            if not disabled and b.is_displayed():
+                b.click()
+                time.sleep(1.2)
+                return True
+    except Exception:
+        pass
+    return False
+
+def infinite_scroll_collect(driver, name_idx, owner_idx, max_idle=3):
+    """
+    For UIs without pagination, keep sending END to load more rows until count stops growing.
+    """
+    seen = set()
+    idle_rounds = 0
+    last_count = 0
+    while True:
+        # collect current batch
+        for rec in extract_rows_on_current_screen(driver, name_idx, owner_idx):
+            seen.add(rec)
+        # scroll
+        driver.find_element(By.TAG_NAME, "body").send_keys(Keys.END)
+        time.sleep(1.0)
+        curr = len(seen)
+        if curr == last_count:
+            idle_rounds += 1
+        else:
+            idle_rounds = 0
+        last_count = curr
+        if idle_rounds >= max_idle:
+            break
+    return list(seen)
+
+def main():
+    driver = open_driver()
+    try:
+        goto_all_views(driver)
+
+        # If SSO: give you time to login, then press Enter in terminal
+        print("\nIf you see a login page, please complete it now.")
+        print("Navigate to Explore ▸ All Views if needed.")
+        input("Press ENTER here once the 'All Views' grid is visible... ")
+
+        ensure_all_views_mode(driver)
+
+        # Wait for grid to be present
+        WebDriverWait(driver, 30).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, '[role="row"]'))
+        )
+
+        name_idx, owner_idx = locate_header_indexes(driver)
+
+        all_records = set()
+
+        # First collect current screen
+        for rec in extract_rows_on_current_screen(driver, name_idx, owner_idx):
+            all_records.add(rec)
+
+        # Try paginating
+        paged_any = False
+        while try_next_page(driver):
+            paged_any = True
+            WebDriverWait(driver, 20).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, '[role="row"]'))
+            )
+            for rec in extract_rows_on_current_screen(driver, name_idx, owner_idx):
+                all_records.add(rec)
+
+        # If no pagination, do infinite scroll harvest
+        if not paged_any:
+            more = infinite_scroll_collect(driver, name_idx, owner_idx)
+            for rec in more:
+                all_records.add(rec)
+
+        # Save
+        rows = sorted(list(all_records), key=lambda x: (x[1].lower(), x[0].lower()))
+        df = pd.DataFrame(rows, columns=["view_name", "owner_name", "view_url"])
+        df.to_csv(OUTPUT, index=False)
+        print(f"\n✅ Saved {len(df):,} rows to {OUTPUT}")
+
+    finally:
+        try:
+            if HEADLESS:
+                driver.quit()
+        except Exception:
+            pass
+
+if __name__ == "__main__":
+    main()
