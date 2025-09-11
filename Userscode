@@ -1,0 +1,410 @@
+# tableau_inventory_all_projects.py
+import os
+import sys
+import subprocess
+import pandas as pd
+import tableauserverclient as TSC
+from datetime import datetime
+import time
+import logging
+
+# ===== EDIT THESE =====
+SERVER      = "https://mytableau.cvs.com"   # Root URL (no '/#/')
+SITE_ID     = "RX_OPS"                      # e.g., RX_OPS
+PAT_NAME    = "xxxxx"
+PAT_SECRET  = "xxxxxxxxxx"
+
+OUTPUT_CSV        = "tableau_inventory_all_projects.csv"
+DOWNLOAD_VIEW_CSV = False                   # True = export underlying data CSVs for each view (needs permission)
+VIEW_CSV_DIR      = "view_csvs"
+PAGE_SIZE         = 50                      # Smaller page size for stability
+MAX_RETRIES       = 3
+RETRY_DELAY       = 2
+# ======================
+
+# Setup logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+def print_progress_bar(current, total, prefix='Progress', suffix='Complete', length=50, fill='█'):
+    """Print a progress bar to terminal"""
+    if total == 0:
+        return
+    percent = f"{100 * (current / float(total)):.1f}"
+    filled_length = int(length * current // total)
+    bar = fill * filled_length + '-' * (length - filled_length)
+    print(f'\r{prefix} |{bar}| {percent}% {suffix} ({current}/{total})', end='', flush=True)
+    if current == total:
+        print()
+
+def retry_request(func, *args, **kwargs):
+    """Retry a request with exponential backoff"""
+    for attempt in range(MAX_RETRIES):
+        try:
+            return func(*args, **kwargs)
+        except Exception as e:
+            if attempt == MAX_RETRIES - 1:
+                raise
+            wait_time = RETRY_DELAY * (2 ** attempt)
+            logger.warning(f"Attempt {attempt + 1} failed: {e}. Retrying in {wait_time}s...")
+            time.sleep(wait_time)
+
+def fetch_all_projects_comprehensive(server):
+    """Fetch ALL projects using multiple methods to ensure we get everything"""
+    print("📁 Fetching ALL projects (comprehensive approach)...")
+    projects_by_id = {}
+    
+    # Method 1: Get all projects with no filters
+    try:
+        print("   Method 1: Standard API call...")
+        req = TSC.RequestOptions()
+        req.page_size = PAGE_SIZE
+        page = 1
+        
+        while True:
+            req.page_number = page
+            projects, pagination = retry_request(server.projects.get, req_options=req)
+            
+            for p in projects:
+                projects_by_id[p.id] = p
+                print(f"   Found: {p.name} (ID: {p.id[:8]}...)")
+            
+            if not (pagination.page_number * pagination.page_size < pagination.total_available):
+                break
+            page += 1
+            
+    except Exception as e:
+        logger.error(f"Method 1 failed: {e}")
+    
+    # Method 2: Try with different request options
+    try:
+        print("   Method 2: Alternative request approach...")
+        alt_req = TSC.RequestOptions()
+        alt_req.page_size = 100  # Try larger page size
+        alt_projects, _ = retry_request(server.projects.get, req_options=alt_req)
+        
+        for p in alt_projects:
+            if p.id not in projects_by_id:
+                projects_by_id[p.id] = p
+                print(f"   Additional: {p.name} (ID: {p.id[:8]}...)")
+                
+    except Exception as e:
+        logger.warning(f"Method 2 failed: {e}")
+    
+    print(f"✅ Total unique projects found: {len(projects_by_id)}")
+    
+    # Print all project names for verification
+    print("\n📋 All projects found:")
+    for i, (proj_id, proj) in enumerate(sorted(projects_by_id.items(), key=lambda x: x[1].name), 1):
+        print(f"   {i:2d}. {proj.name}")
+    
+    return projects_by_id
+
+def get_workbooks_by_project(server, project_id, project_name):
+    """Get workbooks for a specific project"""
+    workbooks = []
+    try:
+        # Create filter for specific project
+        req = TSC.RequestOptions()
+        req.page_size = PAGE_SIZE
+        
+        # Add project filter
+        req.filter.add(TSC.Filter(TSC.RequestOptions.Field.ProjectName, 
+                                 TSC.RequestOptions.Operator.Equals, 
+                                 project_name))
+        
+        page = 1
+        while True:
+            req.page_number = page
+            wb_page, pagination = retry_request(server.workbooks.get, req_options=req)
+            workbooks.extend(wb_page)
+            
+            if not (pagination.page_number * pagination.page_size < pagination.total_available):
+                break
+            page += 1
+            
+    except Exception as e:
+        logger.warning(f"Could not get workbooks for project {project_name}: {e}")
+        
+        # Fallback: get all workbooks and filter manually
+        try:
+            req = TSC.RequestOptions()
+            req.page_size = PAGE_SIZE
+            all_workbooks, _ = retry_request(server.workbooks.get, req_options=req)
+            workbooks = [wb for wb in all_workbooks if wb.project_id == project_id]
+        except Exception as e2:
+            logger.error(f"Fallback also failed for project {project_name}: {e2}")
+    
+    return workbooks
+
+def process_workbook_safe(server, wb, project, ds_by_id):
+    """Process a single workbook safely"""
+    rows = []
+    
+    try:
+        # Get views
+        try:
+            server.workbooks.populate_views(wb)
+        except Exception:
+            wb.views = []
+
+        # Get connections
+        try:
+            server.workbooks.populate_connections(wb)
+        except Exception:
+            wb.connections = []
+
+        wb_url = f"{SERVER}/#/site/{SITE_ID}/workbooks/{wb.content_url}"
+
+        # Process datasources
+        ds_names, ds_types = [], []
+        for c in getattr(wb, "connections", []):
+            ds_obj = ds_by_id.get(getattr(c, "datasource_id", None))
+            if ds_obj:
+                ds_names.append(ds_obj.name or "")
+                ds_types.append(getattr(ds_obj, "connection_type", "") or "")
+            else:
+                ds_names.append(getattr(c, "server_address", "") or "embedded")
+                ds_types.append(getattr(c, "connection_type", "") or "unknown")
+
+        # Process views
+        views = getattr(wb, "views", [])
+        if not views:
+            # Workbook with no views
+            rows.append({
+                "project_name": project.name,
+                "project_id": wb.project_id,
+                "workbook_name": wb.name,
+                "workbook_id": wb.id,
+                "workbook_url": wb_url,
+                "workbook_created": getattr(wb, "created_at", None),
+                "workbook_updated": getattr(wb, "updated_at", None),
+                "owner_id": getattr(wb, "owner_id", None),
+                "view_name": None,
+                "view_id": None,
+                "view_url": None,
+                "view_total_views": None,
+                "datasource_names": "; ".join(sorted(set(n for n in ds_names if n))),
+                "datasource_types": "; ".join(sorted(set(t for t in ds_types if t))),
+                "saved_view_csv": None
+            })
+        else:
+            for v in views:
+                v_url = f"{SERVER}/#/site/{SITE_ID}/views/{v.content_url}"
+                
+                # Try to get view usage
+                total_views = None
+                try:
+                    total_views = getattr(v, "total_views", None)
+                except:
+                    pass
+
+                rows.append({
+                    "project_name": project.name,
+                    "project_id": wb.project_id,
+                    "workbook_name": wb.name,
+                    "workbook_id": wb.id,
+                    "workbook_url": wb_url,
+                    "workbook_created": getattr(wb, "created_at", None),
+                    "workbook_updated": getattr(wb, "updated_at", None),
+                    "owner_id": getattr(wb, "owner_id", None),
+                    "view_name": v.name,
+                    "view_id": v.id,
+                    "view_url": v_url,
+                    "view_total_views": total_views,
+                    "datasource_names": "; ".join(sorted(set(n for n in ds_names if n))),
+                    "datasource_types": "; ".join(sorted(set(t for t in ds_types if t))),
+                    "saved_view_csv": None
+                })
+
+    except Exception as e:
+        logger.error(f"Error processing workbook {wb.name}: {e}")
+        # Add minimal row to show the workbook exists
+        rows.append({
+            "project_name": project.name,
+            "project_id": wb.project_id,
+            "workbook_name": wb.name,
+            "workbook_id": wb.id,
+            "workbook_url": f"ERROR: {e}",
+            "workbook_created": None,
+            "workbook_updated": None,
+            "owner_id": None,
+            "view_name": "ERROR",
+            "view_id": None,
+            "view_url": None,
+            "view_total_views": None,
+            "datasource_names": None,
+            "datasource_types": None,
+            "saved_view_csv": None
+        })
+
+    return rows
+
+def main():
+    print("="*80)
+    print("🚀 TABLEAU INVENTORY EXTRACTION - ALL PROJECTS")
+    print("="*80)
+    start_time = datetime.now()
+    print(f"⏰ Started at: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+    
+    server = TSC.Server(SERVER, use_server_version=True)
+    auth = TSC.PersonalAccessTokenAuth(PAT_NAME, PAT_SECRET, SITE_ID)
+
+    all_rows = []
+
+    try:
+        with server.auth.sign_in(auth):
+            print(f"✅ Successfully connected to {SERVER}")
+            print()
+
+            # Step 1: Get ALL projects
+            projects_by_id = fetch_all_projects_comprehensive(server)
+            
+            if len(projects_by_id) < 20:
+                print(f"⚠️  WARNING: Only found {len(projects_by_id)} projects, but you expected 23!")
+                print("   This might indicate API permissions or filtering issues.")
+                response = input("   Continue anyway? (y/n): ").lower()
+                if response != 'y':
+                    return
+            
+            print()
+
+            # Step 2: Get datasources (optional)
+            print("💾 Fetching datasources...")
+            ds_by_id = {}
+            try:
+                req = TSC.RequestOptions()
+                req.page_size = PAGE_SIZE
+                datasources, _ = retry_request(server.datasources.get, req_options=req)
+                for d in datasources:
+                    ds_by_id[d.id] = d
+                print(f"✅ Found {len(ds_by_id)} datasources")
+            except Exception as e:
+                logger.warning(f"Could not fetch datasources: {e}")
+            print()
+
+            # Step 3: Process each project individually
+            print("="*80)
+            print("📚 PROCESSING PROJECTS ONE BY ONE")
+            print("="*80)
+            
+            total_workbooks_processed = 0
+            
+            for i, (proj_id, project) in enumerate(projects_by_id.items(), 1):
+                print(f"\n📁 [{i:2d}/{len(projects_by_id)}] Processing project: {project.name}")
+                
+                # Get workbooks for this specific project
+                workbooks = get_workbooks_by_project(server, proj_id, project.name)
+                print(f"   📚 Found {len(workbooks)} workbooks in this project")
+                
+                if not workbooks:
+                    # Add project row even if no workbooks
+                    all_rows.append({
+                        "project_name": project.name,
+                        "project_id": proj_id,
+                        "workbook_name": None,
+                        "workbook_id": None,
+                        "workbook_url": None,
+                        "workbook_created": None,
+                        "workbook_updated": None,
+                        "owner_id": None,
+                        "owner_name": None,
+                        "owner_fullname": None,
+                        "owner_email": None,
+                        "view_name": None,
+                        "view_id": None,
+                        "view_url": None,
+                        "view_total_views": None,
+                        "datasource_names": None,
+                        "datasource_types": None,
+                        "saved_view_csv": None
+                    })
+                    continue
+                
+                # Process each workbook in this project
+                for j, wb in enumerate(workbooks, 1):
+                    total_workbooks_processed += 1
+                    print(f"   📊 [{j:3d}/{len(workbooks)}] {wb.name[:50]}...")
+                    
+                    # Process workbook and add rows
+                    wb_rows = process_workbook_safe(server, wb, project, ds_by_id, users_by_id)
+                    all_rows.extend(wb_rows)
+                    
+                    # Progress update
+                    if total_workbooks_processed % 10 == 0:
+                        print(f"   ✅ Total processed so far: {total_workbooks_processed} workbooks")
+                
+                # Save progress after each project
+                if all_rows:
+                    df_temp = pd.DataFrame(all_rows)
+                    temp_file = f"tableau_progress_{i:02d}_projects.csv"
+                    df_temp.to_csv(temp_file, index=False)
+                    print(f"   💾 Progress saved: {temp_file}")
+
+    except KeyboardInterrupt:
+        print(f"\n\n⚠️ Extraction interrupted by user!")
+        print(f"📊 Processed workbooks from {len(set(row['project_name'] for row in all_rows))} projects")
+        
+    except Exception as e:
+        logger.error(f"Unexpected error: {e}")
+        print(f"💾 Saving partial results...")
+
+    # Save final results
+    print(f"\n\n" + "="*80)
+    print("💾 SAVING FINAL RESULTS")
+    print("="*80)
+    
+    if all_rows:
+        df = pd.DataFrame(all_rows)
+        df_sorted = df.sort_values(
+            ["project_name", "workbook_name", "view_name"], na_position="last"
+        )
+        
+        output_path = os.path.abspath(OUTPUT_CSV)
+        df_sorted.to_csv(output_path, index=False)
+
+        # Summary
+        unique_projects = df['project_name'].nunique()
+        unique_workbooks = df[df['workbook_name'].notna()]['workbook_id'].nunique()
+        total_views = len(df[df['view_name'].notna()])
+        
+        end_time = datetime.now()
+        duration = end_time - start_time
+
+        print("="*80)
+        print("🎉 EXTRACTION COMPLETED!")
+        print("="*80)
+        print(f"📊 FINAL SUMMARY:")
+        print(f"   🗂️  Unique Projects: {unique_projects}")
+        print(f"   📚 Unique Workbooks: {unique_workbooks}")
+        print(f"   📄 Total Views: {total_views}")
+        print(f"   📝 Total Rows: {len(df)}")
+        print(f"   ⏱️  Duration: {duration}")
+        print(f"   📁 Output File: {output_path}")
+        
+        # Show project breakdown
+        print(f"\n📋 PROJECT BREAKDOWN:")
+        project_summary = df.groupby('project_name').agg({
+            'workbook_id': lambda x: x.nunique(),
+            'view_name': lambda x: x.notna().sum()
+        }).rename(columns={'workbook_id': 'Workbooks', 'view_name': 'Views'})
+        
+        for proj_name, row in project_summary.iterrows():
+            print(f"   • {proj_name}: {row['Workbooks']} workbooks, {row['Views']} views")
+
+        # Open Excel
+        try:
+            if sys.platform.startswith("win"):
+                subprocess.Popen(["excel.exe", output_path], shell=True)
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", "-a", "Microsoft Excel", output_path])
+            else:
+                subprocess.Popen(["xdg-open", output_path])
+        except:
+            print("⚠️ Could not auto-open Excel")
+            
+    else:
+        print("❌ No data was extracted!")
+
+if __name__ == "__main__":
+    main()
