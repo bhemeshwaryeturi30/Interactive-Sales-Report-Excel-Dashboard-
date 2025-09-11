@@ -11,10 +11,10 @@ import logging
 # ===== EDIT THESE =====
 SERVER      = "https://mytableau.cvs.com"   # Root URL (no '/#/')
 SITE_ID     = "RX_OPS"                      # e.g., RX_OPS
-PAT_NAME    = "xxxxx"
-PAT_SECRET  = "xxxxxxxxxx"
+PAT_NAME    = "auto_script"
+PAT_SECRET  = "zuXZmeNZRTGoUSaGvTI6Fw==:7y0C1efahRdrsgliTCK8tfISdJXNc8mu"
 
-OUTPUT_CSV        = "tableau_inventory_all_projects.csv"
+OUTPUT_CSV        = "tableau_inventory_all_projects_1.csv"
 DOWNLOAD_VIEW_CSV = False                   # True = export underlying data CSVs for each view (needs permission)
 VIEW_CSV_DIR      = "view_csvs"
 PAGE_SIZE         = 50                      # Smaller page size for stability
