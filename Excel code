@@ -1,6 +1,0 @@
-=LET(
-  w, B2,
-  d, C2,
-  types, UNIQUE(FILTER($D:$D, ($B:$B=w)*($C:$C=d))),
-  IF(COUNTA(types)>1, TEXTJOIN("+", TRUE, types), "")
-)
