@@ -1,0 +1,145 @@
+Perfect — this is a Teradata SQL script that performs several analytical queries for pharmacy operations, automation utilization, and workforce metrics. Below is a professional, README-ready explanation you can include in your GitHub repository 👇
+
+⸻
+
+📘 Project Overview
+
+This SQL project connects to a Teradata Data Warehouse and runs a series of custom analytical queries to extract, join, and calculate performance metrics related to store operations, automation efficiency, call center KPIs, and workforce demand.
+These queries are typically used for operational dashboards, reporting automation, and performance tracking across retail divisions and pharmacy stores.
+
+⸻
+
+⚙️ Key Components
+
+1. Database Connection
+
+The script establishes a connection to a Teradata database and accesses schemas such as:
+	•	rxcoe_sa – for automation and colleague NPS data
+	•	RXCOE_EWS – for call performance metrics
+	•	idw_rx_operations_s_bc and idw_common – for operational and calendar dimensions
+	•	RXCOE_WFM – for workforce management (WFM) metrics
+
+⸻
+
+📊 Query Breakdown
+
+Query 4 — Colleague NPS
+
+SEL * FROM rxcoe_sa.PK_Automation_Colleague_NPS;
+
+Purpose:
+Retrieves all records from the PK_Automation_Colleague_NPS table to analyze Net Promoter Score (NPS) data related to colleagues, providing a baseline sentiment score.
+
+⸻
+
+Query 1 — Wecare Call Center KPIs
+
+This complex query joins the Wecare call center performance table with abandonment metrics derived from daily call activity data.
+
+Key Metrics Calculated:
+	•	Abandonment Rate:
+Using numerator (TOT_ABNDN_CALL_CNT + TOT_HOLD_ABNDN_CALL_CNT)
+and denominator (TOT_NON_DRV_UP_CALL_CNT).
+	•	Average Handle Times:
+Includes time to answer, calls on hold, and hold time metrics.
+	•	Filters Applied:
+	•	Only retail stores (AREA_NBR IN (2,4,8,12,14,16))
+	•	Excludes CarePlus stores
+	•	Active stores only (CLOS_DT IS NULL)
+	•	Fiscal week ≥ 202201
+
+This data helps evaluate call handling efficiency and customer experience at the store level.
+
+⸻
+
+Query (Main Automation Metrics) — Store Script Utilization
+
+This query measures automation utilization in pharmacy operations by analyzing prescription fill records.
+
+Key Outputs:
+	•	Total Scripts vs. Automated Scripts
+	•	Automation Type (Y/N)
+	•	Robot Type: SP 100, SP 200, KL, CRS, Parata, etc.
+	•	Number of Cells per Robot
+
+Business Purpose:
+Identifies how effectively automation robots are used in each store, linking fill processes to robot deployments to calculate utilization rates and operational efficiency.
+
+⸻
+
+Query 2 — AVD Workforce Data
+
+SEL 
+fiscal_week_nbr AS "Fiscal Week",
+dim_store AS Store,
+rph_hrs_demand_adj AS "Rph Demand Hrs",
+rph_hrs_act_adj AS "Rph Actual Hrs",
+tech_hrs_demand_adj AS "Tech Demand Hrs",
+tech_hrs_act_adj AS "Tech Actual Hrs"
+FROM RXCOE_WFM.AVD_RX_FS
+...
+
+Purpose:
+Extracts pharmacist (RPh) and technician (Tech) demand vs. actual hours by week.
+Used to analyze labor efficiency and workforce optimization across retail stores.
+
+⸻
+
+Query 5 — mTC Score
+
+SEL * FROM rxcoe_sa.PK_Automation_mTC_Score;
+
+Purpose:
+Retrieves machine learning–based mTC (machine Telemetry/Throughput) Scores for automation systems — used to benchmark robot performance and reliability.
+
+⸻
+
+Query 3 — Sev1 Data
+
+SEL * FROM rxcoe_sa.PK_Automation_Sev1_Data;
+
+Purpose:
+Extracts Severity 1 (Sev1) incident data from automation systems to analyze critical system failures or outages impacting store operations.
+
+⸻
+
+🧠 Business Impact
+
+These queries collectively provide:
+	•	Operational visibility into pharmacy automation and call performance
+	•	Data-driven staffing insights via demand vs. actual hour analysis
+	•	Quality monitoring through NPS and Sev1 incident tracking
+	•	Decision support for optimizing store automation deployment and efficiency
+
+⸻
+
+🚀 How to Run
+	1.	Connect to your Teradata environment using:
+
+bteq .logon <hostname>/<username>,<password>;
+
+
+	2.	Copy and run the SQL script in Teradata SQL Assistant, BTEQ, or any BI tool connected to Teradata.
+	3.	Export the result sets to CSV or connect them to Tableau/Power BI dashboards for visualization.
+
+⸻
+
+🧩 Dependencies
+	•	Teradata Database (v15+)
+	•	Access to schemas:
+	•	rxcoe_sa, RXCOE_EWS, RXCOE_WFM
+	•	idw_common, idw_rx_operations_s_bc
+	•	User must have SELECT privileges on the above datasets.
+
+⸻
+
+📈 Example Use Case
+
+This script can be integrated with a Tableau dashboard to show:
+	•	Automation utilization trends by division/region
+	•	Call performance improvement over fiscal weeks
+	•	NPS score changes correlated with store automation metrics
+
+⸻
+
+Would you like me to format this explanation as a ready-to-copy README.md file (with Markdown headings, syntax highlighting, and bullet formatting)? I can produce that next.
